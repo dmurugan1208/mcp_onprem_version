@@ -274,3 +274,68 @@ class PostgresWorkerRepository:
     def reload(self) -> None:
         """No-op for Postgres (always reads fresh from database)."""
         pass
+
+
+# ============================================================================
+# UserRepository — User account management (JSON-backed, thread-safe)
+# ============================================================================
+
+class UserRepository:
+    """Reads and caches users from sajhamcpserver/config/users.json.
+
+    Thread-safe with lock. Supports reload() to re-read from disk.
+    Default path: ../sajhamcpserver/config/users.json (relative to agent/)
+    """
+
+    def __init__(self, config_path: str = None):
+        """Initialize UserRepository.
+
+        Args:
+            config_path: Path to users.json. If None, uses default relative path.
+        """
+        if config_path is None:
+            agent_dir = os.path.dirname(os.path.abspath(__file__))
+            config_path = os.path.join(agent_dir, '..', 'sajhamcpserver', 'config', 'users.json')
+
+        self._config_path = os.path.abspath(config_path)
+        self._users: list = []
+        self._lock = threading.Lock()
+        self.reload()
+
+    def reload(self) -> None:
+        """Re-read users.json from disk."""
+        with self._lock:
+            try:
+                with open(self._config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._users = data if isinstance(data, list) else data.get('users', [])
+            except FileNotFoundError:
+                self._users = []
+            except Exception:
+                pass
+
+    def find(self, user_id: str) -> Optional[dict]:
+        """Return user dict or None if not found."""
+        with self._lock:
+            for u in self._users:
+                if u.get('user_id') == user_id or u.get('id') == user_id:
+                    return u
+        return None
+
+    def find_by_username(self, username: str) -> Optional[dict]:
+        """Return user by username or None."""
+        with self._lock:
+            for u in self._users:
+                if u.get('username') == username:
+                    return u
+        return None
+
+    def list(self) -> list:
+        """Return all user dicts."""
+        with self._lock:
+            return list(self._users)
+
+    def list_by_role(self, role: str) -> list:
+        """Return all users with a specific role."""
+        with self._lock:
+            return [u for u in self._users if u.get('role') == role]
