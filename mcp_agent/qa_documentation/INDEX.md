@@ -32,7 +32,7 @@ Created: 2026-06-03
 ### 3. **PLAYWRIGHT_TEST_REPORT.md**
    - **Purpose:** Detailed technical metrics and findings
    - **Contents:**
-     - Test suite breakdown (5 suites, 70+ tests)
+     - Test suite breakdown (9 suites, 145+ tests)
      - Detailed findings section
      - What's working / not working
      - Quality metrics
