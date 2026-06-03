@@ -4,8 +4,8 @@
 **Report Generated:** 2026-06-03
 **Test Framework:** Playwright (async)
 **Server:** http://localhost:8000
-**Total Test Suites:** 5
-**Total Tests Executed:** 70+
+**Total Test Suites:** 9
+**Total Tests Executed:** 145+
 
 ---
 

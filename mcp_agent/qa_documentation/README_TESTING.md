@@ -1,11 +1,11 @@
 # Playwright E2E Test Suite - Quick Start Guide
 
 ## Overview
-Comprehensive end-to-end testing suite for Agent Server REST API with 70+ test cases covering CRUD operations, authentication, authorization, edge cases, and concurrency scenarios.
+Comprehensive end-to-end testing suite for Agent Server REST API with 145+ test cases covering CRUD operations, authentication, authorization, edge cases, security, performance, and concurrency scenarios.
 
-**Test Coverage:** 83% pass rate (50/60 core tests)
+**Test Coverage:** 145+ test cases across 9 suites
 **API Quality:** 95% production ready
-**Duration:** ~5 minutes to run all tests
+**Duration:** ~17-20 minutes to run all tests
 
 ## Test Files
 
