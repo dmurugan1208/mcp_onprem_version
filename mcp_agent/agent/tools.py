@@ -272,11 +272,58 @@ async def get_var_contribution(counterparty: str,
                              {'counterparty': counterparty,
                               'confidence_level': confidence_level})
 
+@tool
+def get_worker_info() -> dict:
+    '''Returns information about the current worker configuration.
+    Includes: worker_id, name, agent_mode, enabled_tools count, system_prompt excerpt.
+    Use for: understanding the current worker setup, capabilities, and configuration.
+    '''
+    ctx = _worker_ctx.get()
+    worker_id = ctx.get('worker_id', 'unknown')
+
+    # Load WorkerRepository to get full worker config
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / 'sajhamcpserver'))
+        from agent.repository import WorkerRepository
+
+        config_path = pathlib.Path(__file__).parent.parent / 'sajhamcpserver' / 'config' / 'workers.json'
+        repo = WorkerRepository(config_path=str(config_path.absolute()))
+        worker = repo.find(worker_id)
+
+        if not worker:
+            return {
+                'error': f'Worker {worker_id} not found in repository',
+                'worker_id': worker_id
+            }
+
+        return {
+            'worker_id': worker.get('worker_id'),
+            'name': worker.get('name'),
+            'description': worker.get('description', ''),
+            'enabled': worker.get('enabled', False),
+            'agent_mode': worker.get('agent_mode', 'single'),
+            'enabled_tools_count': len(worker.get('enabled_tools', [])),
+            'enabled_tools_sample': worker.get('enabled_tools', [])[:10],  # First 10 tool names
+            'system_prompt_length': len(worker.get('system_prompt', '')),
+            'system_prompt_preview': worker.get('system_prompt', '')[:200] + '...' if worker.get('system_prompt') else '',
+            'max_concurrent_subagents': worker.get('max_concurrent_subagents', 3),
+            'enable_memory': worker.get('enable_memory', False),
+        }
+    except Exception as e:
+        return {
+            'error': f'Could not retrieve worker info: {str(e)}',
+            'worker_id': worker_id
+        }
+
 STATIC_TOOLS = [
     get_counterparty_exposure, get_trade_inventory, get_credit_limits,
-    get_historical_exposure, get_var_contribution,
+    get_historical_exposure, get_var_contribution, get_worker_info,
 ]
 STATIC_TOOL_NAMES = {t.name for t in STATIC_TOOLS}
+
+# Export the new tool
+AGENT_TOOLS_BEFORE_DISCOVERY = list(STATIC_TOOLS)
 
 
 # ================================================================

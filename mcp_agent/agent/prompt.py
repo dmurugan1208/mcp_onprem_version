@@ -129,11 +129,24 @@ def get_system_prompt(worker: dict, agent_mode: str = 'single') -> str:
     `worker` is the dict already loaded from PostgreSQL (or JSON) by the caller
     — no file I/O happens here.  Falls back to _FALLBACK_PROMPT if
     system_prompt is absent or blank.
+
+    Prepends worker context info so the agent knows about its configuration.
     """
     prompt = (worker.get('system_prompt') or '').strip()
     if not prompt:
         prompt = _FALLBACK_PROMPT
-    return _augment_prompt(prompt, agent_mode)
+
+    # Prepend worker context information
+    worker_context = f"""=== YOUR WORKER CONFIGURATION ===
+You are a specialized agent for worker: {worker.get('worker_id', 'unknown')} ({worker.get('name', 'Unknown')})
+Agent mode: {worker.get('agent_mode', 'single')}
+Available tools: {len(worker.get('enabled_tools', []))} tools
+
+To learn more about your configuration, use the `get_worker_info` tool.
+
+"""
+
+    return _augment_prompt(worker_context + prompt, agent_mode)
 
 
 SUMMARISE_PROMPT = """You are a context compressor for a financial risk intelligence session on the B-Pulse platform.
