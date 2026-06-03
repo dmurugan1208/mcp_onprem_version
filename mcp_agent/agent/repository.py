@@ -16,9 +16,10 @@ from typing import Optional
 
 
 class WorkerRepository:
-    """Reads and caches workers from sajhamcpserver/config/workers.json.
+    """Manages workers in sajhamcpserver/config/workers.json with full CRUD.
 
-    Thread-safe with lock. Supports reload() to re-read from disk.
+    Thread-safe with lock. Supports create, read, update, delete operations.
+    Writes changes back to JSON file immediately.
     Default path: ../sajhamcpserver/config/workers.json (relative to agent/)
     """
 
@@ -51,18 +52,27 @@ class WorkerRepository:
                 # Keep existing data on error, log but don't crash
                 pass
 
+    def _save(self) -> None:
+        """Write workers back to JSON file."""
+        try:
+            os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
+            with open(self._config_path, 'w', encoding='utf-8') as f:
+                json.dump(self._workers, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     def find(self, worker_id: str) -> Optional[dict]:
         """Return worker config dict or None if not found."""
         with self._lock:
             for w in self._workers:
                 if w.get('worker_id') == worker_id or w.get('id') == worker_id:
-                    return w
+                    return dict(w)
         return None
 
     def list(self) -> list:
         """Return all worker configs."""
         with self._lock:
-            return list(self._workers)
+            return [dict(w) for w in self._workers]
 
     def find_by_user(self, user_id: str) -> Optional[dict]:
         """Return the worker a user is assigned to, or None."""
@@ -70,12 +80,54 @@ class WorkerRepository:
             for w in self._workers:
                 users = w.get('assigned_users', w.get('users', []))
                 if user_id in users:
-                    return w
+                    return dict(w)
                 # Also check user objects with user_id field
                 for u in users:
                     if isinstance(u, dict) and u.get('user_id') == user_id:
-                        return w
+                        return dict(w)
         return None
+
+    def create(self, worker_data: dict) -> dict:
+        """Create a new worker. Returns the created worker dict."""
+        with self._lock:
+            worker_id = worker_data.get('worker_id')
+            if not worker_id:
+                raise ValueError("worker_id is required")
+
+            # Check if already exists
+            for w in self._workers:
+                if w.get('worker_id') == worker_id:
+                    raise ValueError(f"Worker {worker_id} already exists")
+
+            # Add to list
+            new_worker = dict(worker_data)
+            self._workers.append(new_worker)
+            self._save()
+            return dict(new_worker)
+
+    def update(self, worker_id: str, worker_data: dict) -> dict:
+        """Update an existing worker. Returns the updated worker dict."""
+        with self._lock:
+            for i, w in enumerate(self._workers):
+                if w.get('worker_id') == worker_id or w.get('id') == worker_id:
+                    # Merge updates, preserving worker_id
+                    updated = dict(w)
+                    updated.update(worker_data)
+                    updated['worker_id'] = worker_id
+                    self._workers[i] = updated
+                    self._save()
+                    return dict(updated)
+            raise ValueError(f"Worker {worker_id} not found")
+
+    def delete(self, worker_id: str) -> bool:
+        """Delete a worker. Returns True if deleted, False if not found."""
+        with self._lock:
+            for i, w in enumerate(self._workers):
+                if w.get('worker_id') == worker_id or w.get('id') == worker_id:
+                    self._workers.pop(i)
+                    self._save()
+                    return True
+            return False
 
 
 class PostgresWorkerRepository:
@@ -281,9 +333,10 @@ class PostgresWorkerRepository:
 # ============================================================================
 
 class UserRepository:
-    """Reads and caches users from sajhamcpserver/config/users.json.
+    """Manages users in sajhamcpserver/config/users.json with full CRUD.
 
-    Thread-safe with lock. Supports reload() to re-read from disk.
+    Thread-safe with lock. Supports create, read, update, delete operations.
+    Writes changes back to JSON file immediately.
     Default path: ../sajhamcpserver/config/users.json (relative to agent/)
     """
 
@@ -314,12 +367,21 @@ class UserRepository:
             except Exception:
                 pass
 
+    def _save(self) -> None:
+        """Write users back to JSON file."""
+        try:
+            os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
+            with open(self._config_path, 'w', encoding='utf-8') as f:
+                json.dump(self._users, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     def find(self, user_id: str) -> Optional[dict]:
         """Return user dict or None if not found."""
         with self._lock:
             for u in self._users:
                 if u.get('user_id') == user_id or u.get('id') == user_id:
-                    return u
+                    return dict(u)
         return None
 
     def find_by_username(self, username: str) -> Optional[dict]:
@@ -327,15 +389,57 @@ class UserRepository:
         with self._lock:
             for u in self._users:
                 if u.get('username') == username:
-                    return u
+                    return dict(u)
         return None
 
     def list(self) -> list:
         """Return all user dicts."""
         with self._lock:
-            return list(self._users)
+            return [dict(u) for u in self._users]
 
     def list_by_role(self, role: str) -> list:
         """Return all users with a specific role."""
         with self._lock:
-            return [u for u in self._users if u.get('role') == role]
+            return [dict(u) for u in self._users if u.get('role') == role]
+
+    def create(self, user_data: dict) -> dict:
+        """Create a new user. Returns the created user dict."""
+        with self._lock:
+            user_id = user_data.get('user_id')
+            if not user_id:
+                raise ValueError("user_id is required")
+
+            # Check if already exists
+            for u in self._users:
+                if u.get('user_id') == user_id:
+                    raise ValueError(f"User {user_id} already exists")
+
+            # Add to list
+            new_user = dict(user_data)
+            self._users.append(new_user)
+            self._save()
+            return dict(new_user)
+
+    def update(self, user_id: str, user_data: dict) -> dict:
+        """Update an existing user. Returns the updated user dict."""
+        with self._lock:
+            for i, u in enumerate(self._users):
+                if u.get('user_id') == user_id or u.get('id') == user_id:
+                    # Merge updates, preserving user_id
+                    updated = dict(u)
+                    updated.update(user_data)
+                    updated['user_id'] = user_id
+                    self._users[i] = updated
+                    self._save()
+                    return dict(updated)
+            raise ValueError(f"User {user_id} not found")
+
+    def delete(self, user_id: str) -> bool:
+        """Delete a user. Returns True if deleted, False if not found."""
+        with self._lock:
+            for i, u in enumerate(self._users):
+                if u.get('user_id') == user_id or u.get('id') == user_id:
+                    self._users.pop(i)
+                    self._save()
+                    return True
+            return False
