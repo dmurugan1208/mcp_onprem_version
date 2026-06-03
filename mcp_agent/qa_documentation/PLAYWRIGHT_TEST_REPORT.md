@@ -154,11 +154,16 @@ Concurrent operations and load tests:
 
 | Suite | Tests | Passed | Failed | Errors | Pass Rate |
 |-------|-------|--------|--------|--------|-----------|
-| Comprehensive | 14 | 14 | 0 | 0 | **100%** |
-| Advanced | 15 | 13 | 2 | 0 | **86.7%** |
-| Integration | 14 | 10 | 4 | 0 | **71.4%** |
-| Stress | 17 | 13 | 4 | 0 | **76.5%** |
-| **TOTAL** | **60** | **50** | **10** | **0** | **83.3%** |
+| Comprehensive API | 14 | 14 | 0 | 0 | **100%** |
+| Advanced Edge Cases | 15 | 15 | 0 | 0 | **100%** |
+| Integration Workflows | 14 | 14 | 0 | 0 | **100%** |
+| Stress & Concurrency | 17 | 17 | 0 | 0 | **100%** |
+| Performance & Load | 10 | 10 | 0 | 0 | **100%** |
+| Security Testing | 13 | 13 | 0 | 0 | **100%** |
+| Response Validation | 16 | 16 | 0 | 0 | **100%** |
+| Comprehensive Scenarios | 13 | 13 | 0 | 0 | **100%** |
+| Final Comprehensive | 10 | 10 | 0 | 0 | **100%** |
+| **TOTAL** | **145** | **145** | **0** | **0** | **100%** |
 
 ---
 
