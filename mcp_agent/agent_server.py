@@ -1,0 +1,3782 @@
+import os, json, uuid, pathlib, base64, sys as _sys, hmac, hashlib, time, shutil
+import aiofiles
+import os as _os
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Optional, List
+from dotenv import load_dotenv
+load_dotenv()  # must run before any os.getenv() checks (incl. _DB_ENABLED below)
+import httpx
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # kept as fallback
+import agent.agent as _agent_module
+from agent.agent import create_agent_for_worker
+from agent.prompt import get_system_prompt
+from agent.tools import _service_headers, _worker_ctx, SAJHA_BASE, get_tools_for_worker, AGENT_TOOLS
+from agent.summariser import count_tokens_accurate, _pending_summary_events
+
+_WORKFLOWS_DIR = pathlib.Path('sajhamcpserver/data/workflows')
+_UPLOADS_DIR   = pathlib.Path('sajhamcpserver/data/uploads')
+# _METADATA_FILE is now per-worker — resolved in _read/_write_metadata via worker_id.
+# This sentinel is kept for local single-worker dev fallback only.
+_METADATA_FILE = _WORKFLOWS_DIR / '.metadata.json'
+
+
+def _worker_metadata_file(worker_id: str) -> pathlib.Path:
+    """Return per-worker metadata file path (local dev fallback only)."""
+    if worker_id:
+        return pathlib.Path(f'sajhamcpserver/data/workers/{worker_id}/workflows/.metadata.json')
+    return _METADATA_FILE
+
+# SSE writer ContextVar — set per-request so sub_agent_tool can forward events
+# into the active SSE stream without needing a reference to the stream generator.
+from agent.sub_agent_tool import set_stream_writer as _set_stream_writer
+
+_sys.path.insert(0, str(pathlib.Path(__file__).parent / 'sajhamcpserver'))
+from sajha.tools.impl.fs_index import build_index, get_index
+from agent.repository import WorkerRepository as _WorkerRepository, PostgresWorkerRepository as _PGWorkerRepository
+from sajha.storage import storage as _storage
+_S3_MODE = os.getenv('STORAGE_BACKEND', 'local') == 's3'
+
+# REQ-07: PostgreSQL DB layer (enabled when DATABASE_URL is set)
+_DB_ENABLED = bool(os.getenv('DATABASE_URL'))
+if _DB_ENABLED:
+    from sajha.db import repo as _db_repo
+
+_JWT_SECRET = os.getenv('JWT_SECRET', 'sajha-dev-secret-change-in-prod')
+_SAJHA_USERS_FILE  = pathlib.Path('sajhamcpserver/config/users.json')
+_SAJHA_WORKERS_FILE = pathlib.Path('sajhamcpserver/config/workers.json')
+
+_STORAGE_BACKEND = _os.environ.get('STORAGE_BACKEND', 'local')
+
+# WorkerRepository singleton — Postgres when DATABASE_URL set, JSON fallback (REQ-07 P1)
+if _DB_ENABLED:
+    _worker_repo = _PGWorkerRepository()
+else:
+    _worker_repo = _WorkerRepository(config_path=str(_SAJHA_WORKERS_FILE))
+
+
+def serve_file(path: str, media_type: str = None) -> Response:
+    """Serve a file. Local: FileResponse. S3: redirect to pre-signed URL. (REQ-08a)"""
+    if _STORAGE_BACKEND == 'local':
+        return FileResponse(path, media_type=media_type) if media_type else FileResponse(path)
+    else:
+        # S3: return pre-signed URL as a redirect
+        from sajha.storage import storage as _storage
+        url = _storage.generate_presigned_url(path, expiry=300)
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=url, status_code=302)
+
+
+# ── JWT helpers ────────────────────────────────────────────────────────────────
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = 4 - len(s) % 4
+    if pad != 4:
+        s += '=' * pad
+    return base64.urlsafe_b64decode(s)
+
+
+def _jwt_encode(payload: dict) -> str:
+    header = _b64url_encode(b'{"alg":"HS256","typ":"JWT"}')
+    body = _b64url_encode(json.dumps(payload).encode())
+    sig_input = f"{header}.{body}".encode()
+    sig = hmac.new(_JWT_SECRET.encode(), sig_input, hashlib.sha256).digest()
+    return f"{header}.{body}.{_b64url_encode(sig)}"
+
+
+def _jwt_decode(token: str) -> dict:
+    parts = token.split('.')
+    if len(parts) != 3:
+        raise ValueError("Invalid JWT format")
+    header, body, sig = parts
+    sig_input = f"{header}.{body}".encode()
+    expected = hmac.new(_JWT_SECRET.encode(), sig_input, hashlib.sha256).digest()
+    provided = _b64url_decode(sig)
+    if not hmac.compare_digest(expected, provided):
+        raise ValueError("Invalid JWT signature")
+    payload = json.loads(_b64url_decode(body))
+    if payload.get('exp', float('inf')) < time.time():
+        raise ValueError("JWT expired")
+    return payload
+
+
+# ── Users & Workers persistence ────────────────────────────────────────────────
+
+def _load_users() -> list:
+    """Load users — PostgreSQL when DB is enabled, JSON file in local dev."""
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, _db_repo.list_users()).result(timeout=5)
+            return loop.run_until_complete(_db_repo.list_users())
+        except Exception as _e:
+            raise HTTPException(status_code=503, detail=f'Database unavailable: {_e}')
+    try:
+        return json.loads(_SAJHA_USERS_FILE.read_text()).get('users', [])
+    except Exception:
+        return []
+
+
+def _save_users(users: list):
+    """Persist users. Dual-write: PostgreSQL (if enabled) + JSON file."""
+    for u in users:
+        u.pop('password', None)
+        u.pop('roles', None)
+    if _DB_ENABLED:
+        import asyncio
+        async def _upsert_all():
+            for u in users:
+                try:
+                    await _db_repo.upsert_user(u)
+                except Exception:
+                    pass
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(asyncio.run, _upsert_all()).result(timeout=5)
+            else:
+                loop.run_until_complete(_upsert_all())
+        except Exception:
+            pass
+    # Always keep JSON in sync (dual-write)
+    _SAJHA_USERS_FILE.write_text(json.dumps({'users': users}, indent=2))
+
+
+def _find_user(user_id: str) -> Optional[dict]:
+    """Find user by ID — PostgreSQL when DB enabled, JSON file in local dev."""
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, _db_repo.get_user(user_id)).result(timeout=5)
+            return loop.run_until_complete(_db_repo.get_user(user_id))
+        except HTTPException:
+            raise
+        except Exception as _e:
+            raise HTTPException(status_code=503, detail=f'Database unavailable: {_e}')
+    for u in _load_users():
+        if u.get('user_id') == user_id:
+            return u
+    return None
+
+
+def _load_workers() -> list:
+    """Return all workers via WorkerRepository (REQ-PREP-06)."""
+    return _worker_repo.list()
+
+
+def _save_workers(workers: list):
+    """Persist workers to disk (for SAJHA hot-reload) and sync to Postgres when DB is enabled."""
+    _SAJHA_WORKERS_FILE.write_text(json.dumps({'workers': workers}, indent=2))
+    if _DB_ENABLED:
+        # Sync full worker list to Postgres so PostgresWorkerRepository reads are consistent
+        try:
+            import psycopg, re as _re
+            raw_dsn = os.getenv('DATABASE_URL', '')
+            dsn = _re.sub(r'^postgresql(\+asyncpg|\+psycopg2?|\+psycopg)?://', 'postgresql://', raw_dsn)
+            with psycopg.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    for w in workers:
+                        wid = w.get('worker_id') or w.get('id', '')
+                        if not wid:
+                            continue
+                        cur.execute(
+                            """
+                            INSERT INTO workers
+                                (worker_id, name, description, system_prompt,
+                                 enabled_tools, domain_data_path, verified_wf_path,
+                                 connector_scope, enabled,
+                                 my_workflows_path, templates_path, my_data_path,
+                                 common_data_path, updated_at)
+                            VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,NOW())
+                            ON CONFLICT (worker_id) DO UPDATE SET
+                                name               = EXCLUDED.name,
+                                description        = EXCLUDED.description,
+                                system_prompt      = EXCLUDED.system_prompt,
+                                enabled_tools      = EXCLUDED.enabled_tools,
+                                domain_data_path   = EXCLUDED.domain_data_path,
+                                verified_wf_path   = EXCLUDED.verified_wf_path,
+                                connector_scope    = EXCLUDED.connector_scope,
+                                enabled            = EXCLUDED.enabled,
+                                my_workflows_path  = EXCLUDED.my_workflows_path,
+                                templates_path     = EXCLUDED.templates_path,
+                                my_data_path       = EXCLUDED.my_data_path,
+                                common_data_path   = EXCLUDED.common_data_path,
+                                updated_at         = NOW()
+                            """,
+                            (
+                                wid,
+                                w.get('name', wid),
+                                w.get('description', ''),
+                                w.get('system_prompt', ''),
+                                json.dumps(w.get('enabled_tools', ['*'])),
+                                w.get('domain_data_path', ''),
+                                w.get('verified_wf_path') or w.get('workflows_path', ''),
+                                json.dumps(w.get('connector_scope', {})),
+                                bool(w.get('enabled', True)),
+                                w.get('my_workflows_path', ''),
+                                w.get('templates_path', ''),
+                                w.get('my_data_path', ''),
+                                w.get('common_data_path', ''),
+                            )
+                        )
+                    # Delete workers removed from the list
+                    if workers:
+                        ids = [w.get('worker_id') or w.get('id', '') for w in workers if w.get('worker_id') or w.get('id')]
+                        placeholders = ','.join(['%s'] * len(ids))
+                        cur.execute(f"DELETE FROM workers WHERE worker_id NOT IN ({placeholders})", ids)
+                conn.commit()
+        except Exception as _e:
+            import logging
+            logging.getLogger(__name__).warning("_save_workers Postgres sync failed: %s", _e)
+    _worker_repo.reload()
+
+
+def _find_worker(worker_id: str) -> Optional[dict]:
+    """Find a worker by ID via WorkerRepository (REQ-PREP-06)."""
+    return _worker_repo.find(worker_id)
+
+
+def _verify_password(plain: str, user: dict) -> bool:
+    """Check password against bcrypt hash. Plaintext fallback removed (G-11)."""
+    stored_hash = user.get('password_hash', '')
+    if stored_hash:
+        try:
+            import bcrypt
+            return bcrypt.checkpw(plain.encode(), stored_hash.encode())
+        except Exception:
+            pass
+    return False
+
+
+def _hash_password(plain: str) -> str:
+    try:
+        import bcrypt
+        return bcrypt.hashpw(plain.encode(), bcrypt.gensalt(rounds=12)).decode()
+    except ImportError:
+        return ''  # bcrypt not installed — plaintext fallback
+
+
+def _get_user_role(user: dict) -> str:
+    """Return canonical role string. Reads role field only (G-10 — roles[] array removed)."""
+    return user.get('role', 'user')
+
+
+def _resolve_worker_for_user(user: dict, requested_worker_id: str = None) -> Optional[dict]:
+    """Return the worker context for a user. Super admins can specify any worker."""
+    role = _get_user_role(user)
+    if role == 'super_admin':
+        wid = requested_worker_id or (user.get('worker_id'))
+        if wid:
+            return _find_worker(wid)
+        # Default to first worker
+        workers = _load_workers()
+        return workers[0] if workers else None
+    else:
+        wid = user.get('worker_id')
+        return _find_worker(wid) if wid else None
+
+
+def _seed_worker_folders(worker_id: str):
+    """Create the full scoped folder tree for a new worker (G-07). Skipped in S3 mode."""
+    if _S3_MODE:
+        return  # S3 has no directories; folders are virtual
+    base = pathlib.Path(f'sajhamcpserver/data/workers/{worker_id}')
+    for sub in [
+        'domain_data',
+        'workflows/verified', 'workflows/my',
+        'templates', 'my_data',
+    ]:
+        (base / sub).mkdir(parents=True, exist_ok=True)
+
+
+def _clone_worker_folder(src_id: str, dst_id: str):
+    """Clone source worker's folder to destination, excluding my_data (user-owned, REQ-MD-01)."""
+    if _S3_MODE:
+        return  # S3 mode: worker templates/domain data cloning handled separately if needed
+    src = pathlib.Path(f'sajhamcpserver/data/workers/{src_id}')
+    dst = pathlib.Path(f'sajhamcpserver/data/workers/{dst_id}')
+    if src.exists():
+        shutil.copytree(str(src), str(dst),
+                        ignore=shutil.ignore_patterns('my_data'),  # exclude entire my_data tree
+                        dirs_exist_ok=True)
+    # Ensure my_data exists but is empty (no user data copied into the clone)
+    (dst / 'my_data').mkdir(parents=True, exist_ok=True)
+
+
+_DATA_ROOT     = pathlib.Path('sajhamcpserver/data')
+_COMMON_DATA   = _DATA_ROOT / 'common'
+_AUDIT_LOG     = _DATA_ROOT / 'audit' / 'tool_calls.jsonl'
+
+# Sections that users may write to (uploads, my-docs, personal workflows)
+_WRITABLE_SECTIONS = {'uploads', 'my_workflows', 'my_data'}
+
+# REQ-WF-01/REQ-DD-01/REQ-DD-02: global _DOMAIN_DATA, _MY_DATA, _VERIFIED_WF, _MY_WF constants
+# retired — global directories migrated to worker-scoped paths. Legacy admin endpoints now
+# route through _admin_section_roots_for_worker() or worker-scoped paths directly.
+_ADMIN_SECTION_ROOTS: dict = {}  # no global sections remain; kept for legacy endpoint compatibility
+
+# Thread ownership registry — maps thread_id → {user_id, worker_id, created_at}
+_THREAD_REGISTRY_FILE = _DATA_ROOT / 'threads.jsonl'
+_thread_registry: dict = {}
+
+def _load_thread_registry():
+    """Load thread registry — JSONL file into in-memory dict (startup fallback).
+    When DB is enabled, thread lookups use PostgreSQL directly at query time."""
+    if not _THREAD_REGISTRY_FILE.exists():
+        return
+    for line in _THREAD_REGISTRY_FILE.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+            tid = entry.pop('thread_id', None)
+            if tid:
+                _thread_registry[tid] = entry
+        except Exception:
+            pass
+
+
+async def _persist_thread(thread_id: str, meta: dict):
+    """Register a new thread — PostgreSQL primary, JSONL fallback for local dev."""
+    if _DB_ENABLED:
+        try:
+            await _db_repo.register_thread(
+                thread_id,
+                meta.get('user_id', ''),
+                meta.get('worker_id', ''),
+                title=meta.get('title'),
+            )
+            return
+        except Exception:
+            pass
+    # Local dev fallback: JSONL file
+    try:
+        _THREAD_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_THREAD_REGISTRY_FILE, 'a') as f:
+            f.write(json.dumps({'thread_id': thread_id, **meta}) + '\n')
+    except Exception:
+        pass
+
+# Login rate-limit: {user_id: [timestamp, ...]}
+_login_attempts: dict = {}
+_LOGIN_WINDOW = 60   # seconds
+_LOGIN_MAX    = 10   # max attempts per window
+
+
+def _resolve_worker_path(worker: dict, section: str, rel: str = '') -> pathlib.Path:
+    """Resolve a worker-scoped filesystem path for a given section (G-03).
+
+    All paths are relative to sajhamcpserver/ as the base directory.
+    Creates the root if it doesn't exist (lazy mkdir on first access).
+    """
+    base = pathlib.Path('sajhamcpserver')
+    dd = worker.get('domain_data_path', './data/domain_data')
+    mapping = {
+        'domain_data':        dd,
+        'uploads':            dd.rstrip('/') + '/uploads',
+        'verified':           worker.get('workflows_path',    './data/workflows/verified'),
+        'verified_workflows': worker.get('workflows_path',    './data/workflows/verified'),  # canonical alias (REQ-WF-02)
+        'my_workflows':       worker.get('my_workflows_path', './data/workflows/my'),
+        'templates':          worker.get('templates_path',    './data/domain_data/templates'),
+        'my_data':            worker.get('my_data_path',      './data/uploads'),
+        'common':             worker.get('common_data_path',  './data/common'),
+    }
+    raw = mapping.get(section)
+    if raw is None:
+        raise HTTPException(status_code=400, detail=f'Unknown section: {section}')
+    root = (base / raw.lstrip('./')).resolve()
+    if not _S3_MODE:
+        root.mkdir(parents=True, exist_ok=True)
+    if rel:
+        full = (root / rel).resolve()
+        if not str(full).startswith(str(root)):
+            raise HTTPException(status_code=400, detail='Path traversal not allowed')
+        return full
+    return root
+
+
+def _assign_user_to_worker(user_id: str, worker_id: str | None, role: str | None = None):
+    """Atomically update both users.json and workers.json when assigning a user (G-09)."""
+    import datetime
+    users = _load_users()
+    workers = _load_workers()
+
+    old_worker_id = None
+    for u in users:
+        if u.get('user_id') == user_id:
+            old_worker_id = u.get('worker_id')
+            u['worker_id'] = worker_id
+            if role:
+                u['role'] = role
+            break
+
+    # Remove from old worker's assigned_users
+    if old_worker_id and old_worker_id != worker_id:
+        for w in workers:
+            if w['worker_id'] == old_worker_id:
+                w['assigned_users'] = [uid for uid in w.get('assigned_users', []) if uid != user_id]
+                break
+
+    # Add to new worker's assigned_users
+    if worker_id:
+        for w in workers:
+            if w['worker_id'] == worker_id:
+                assigned = w.get('assigned_users', [])
+                if user_id not in assigned:
+                    assigned.append(user_id)
+                w['assigned_users'] = assigned
+                # FIX 7: Create per-user my_data subdirectory at assignment time
+                raw_my_data = w.get('my_data_path', './data/uploads')
+                try:
+                    if _S3_MODE:
+                        pass  # S3: directories are virtual; skip mkdir
+                    else:
+                        user_dir = (pathlib.Path('sajhamcpserver') / raw_my_data.lstrip('./') / user_id).resolve()
+                        user_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as _e:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        f"Could not create my_data dir for user '{user_id}' in worker '{worker_id}': {_e}"
+                    )
+                break
+
+    _save_users(users)
+    _save_workers(workers)
+
+
+def _resolve_admin_path(section: str, rel: str = '') -> pathlib.Path:
+    root = _ADMIN_SECTION_ROOTS.get(section)
+    if root is None:
+        raise HTTPException(status_code=400, detail=f'Unknown admin section: {section}')
+    if rel:
+        full = (root / rel).resolve()
+        if not str(full).startswith(str(root.resolve())):
+            raise HTTPException(status_code=400, detail='Path traversal not allowed')
+        return full
+    return root
+
+
+def _admin_section_roots_for_worker(worker: dict) -> dict:
+    """Return admin-accessible section roots scoped to a worker's paths (REQ-WF-03).
+
+    Includes section aliases so the super-admin chat worker-switcher can route
+    all left-sidebar tree sections through /api/super/workers/{id}/files/{section}:
+      verified   → workflows_path  (alias for verified_workflows)
+      uploads    → my_data_path    (alias for my_data; worker-wide, not user-scoped)
+      my_data    → my_data_path    (canonical)
+    common is writable by admin+ and read-only for users (REQ-10).
+    """
+    base = pathlib.Path('sajhamcpserver')
+    dd     = base / worker.get('domain_data_path',  './data/domain_data').lstrip('./')
+    wf     = base / worker.get('workflows_path',     './data/workflows/verified').lstrip('./')
+    mywf   = base / worker.get('my_workflows_path',  './data/workflows/my').lstrip('./')
+    common = base / worker.get('common_data_path',   './data/common').lstrip('./')
+    mydata = base / worker.get('my_data_path',       './data/uploads').lstrip('./')
+    return {
+        'domain_data': dd,
+        'verified_workflows': wf,
+        'verified': wf,          # alias used by chat left-panel section name
+        'my_workflows': mywf,
+        'common': common,
+        'my_data': mydata,       # full worker my_data tree (not user-scoped)
+        'uploads': mydata,       # alias used by chat left-panel section name
+    }
+
+
+def _resolve_admin_path_for_worker(worker: dict, section: str, rel: str = '') -> pathlib.Path:
+    roots = _admin_section_roots_for_worker(worker)
+    root = roots.get(section)
+    if root is None:
+        raise HTTPException(status_code=400, detail=f'Unknown admin section: {section}')
+    root_resolved = root.resolve()
+    if not _S3_MODE:
+        root_resolved.mkdir(parents=True, exist_ok=True)
+    if rel:
+        full = (root_resolved / rel).resolve()
+        if not str(full).startswith(str(root_resolved)):
+            raise HTTPException(status_code=400, detail='Path traversal not allowed')
+        return full
+    return root_resolved
+
+
+# Ensure common data directory exists (local mode only — S3 has no dirs)
+if not _S3_MODE:
+    _COMMON_DATA.mkdir(parents=True, exist_ok=True)
+_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+_load_thread_registry()
+
+
+def _parse_worker_section_from_path(root_path: str) -> tuple[str | None, str | None]:
+    """Extract (worker_id, section) from a worker-scoped local path.
+    e.g. 'sajhamcpserver/data/workers/w-market-risk/domain_data' → ('w-market-risk', 'domain_data')
+    Returns (None, None) for paths outside the worker tree (e.g. common/).
+    """
+    import re
+    m = re.search(r'workers/([^/]+)/([^/]+)', root_path.replace('\\', '/'))
+    if m:
+        return m.group(1), m.group(2)
+    if 'common' in root_path:
+        return None, 'common'
+    return None, None
+
+
+def _build_and_sync(root_path: str, worker_id: str = None, section: str = None,
+                    user_id: str = None) -> dict:
+    """REQ-08a: Call build_index() (local filesystem) and background-sync to PostgreSQL file_metadata.
+    worker_id/section auto-detected from path when not provided.
+    Returns the index dict (same as build_index).
+    """
+    idx = build_index(root_path)
+    if _DB_ENABLED:
+        # Auto-detect context from path when not provided
+        if not worker_id or not section:
+            _wid, _sec = _parse_worker_section_from_path(root_path)
+            worker_id = worker_id or _wid
+            section   = section   or _sec
+        if worker_id and section:
+            import asyncio
+            async def _sync():
+                try:
+                    await _db_repo.upsert_file_metadata(
+                        worker_id=worker_id, section=section,
+                        rel_path=root_path, file_name=os.path.basename(root_path),
+                        is_folder=True, user_id=user_id,
+                    )
+                    for entry in idx.get('tree', []):
+                        await _db_repo.upsert_file_metadata(
+                            worker_id=worker_id, section=section,
+                            rel_path=entry['path'], file_name=entry['name'],
+                            size_bytes=entry.get('size_bytes'),
+                            mime_type=entry.get('mime'),
+                            is_folder=(entry['type'] == 'folder'),
+                            user_id=user_id,
+                        )
+                except Exception:
+                    pass
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(_sync())
+                else:
+                    loop.run_until_complete(_sync())
+            except Exception:
+                pass
+    return idx
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Initialize checkpointer on startup. Uses PostgresSaver when DATABASE_URL is set,
+    falls back to AsyncSqliteSaver for local development. (REQ-07)"""
+    _pg_url = os.getenv('DATABASE_URL')
+    if _pg_url and _DB_ENABLED:
+        # Create all ORM tables + seed users on first run (safe to call every startup)
+        try:
+            await _db_repo.ensure_all_tables()
+        except Exception as _all_err:
+            logging.getLogger(__name__).warning("ensure_all_tables failed: %s", _all_err)
+        # Ensure auxiliary tables that are not ORM-managed
+        try:
+            await _db_repo._ensure_conversation_threads_table()
+        except Exception as _ct_err:
+            logging.getLogger(__name__).warning("conversation_threads ensure failed: %s", _ct_err)
+        try:
+            await _db_repo.ensure_app_config_table()
+        except Exception as _ac_err:
+            logging.getLogger(__name__).warning("app_config table ensure failed: %s", _ac_err)
+        try:
+            await _db_repo.ensure_workflow_metadata_table()
+        except Exception as _wm_err:
+            logging.getLogger(__name__).warning("workflow_metadata table ensure failed: %s", _wm_err)
+    if _pg_url:
+        # PostgreSQL checkpointer — production path
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            # Convert SQLAlchemy URL to plain psycopg URL for langgraph-checkpoint-postgres
+            pg_conn = _pg_url.replace('postgresql+asyncpg://', 'postgresql://').replace('postgresql+psycopg2://', 'postgresql://').replace('postgresql+psycopg://', 'postgresql://')
+            async with AsyncPostgresSaver.from_conn_string(pg_conn) as cp:
+                await cp.setup()  # creates checkpoint tables if not exists
+                _agent_module.set_checkpointer(cp)
+                yield
+            return
+        except Exception as e:
+            print(f'WARNING: PostgresSaver failed ({e}), falling back to SQLite checkpointer')
+    # SQLite fallback — local dev without DATABASE_URL
+    _db_path = os.getenv('CHECKPOINT_DB_PATH', './sajhamcpserver/data/checkpoints.db')
+    pathlib.Path(_db_path).parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(_db_path) as cp:
+        _agent_module.set_checkpointer(cp)
+        yield
+
+
+app = FastAPI(title='MCP Intelligence Agent', lifespan=_lifespan)
+_cors_origins = os.getenv('CORS_ORIGINS', 'http://localhost:8080,http://127.0.0.1:8080').split(',')
+# 'null' allows file:// origins in local dev (browser sends Origin: null for file:// pages)
+_cors_origins = list({*_cors_origins, 'null', 'http://localhost:8000', 'http://127.0.0.1:8000'})
+app.add_middleware(CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_origin_regex=r'https://.*\.vercel\.app',
+    allow_methods=['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    allow_headers=['Content-Type', 'Authorization'],
+)
+
+# API key auth — for agent run endpoint
+_raw_keys = os.getenv('AGENT_API_KEYS', '')
+_VALID_KEYS: set = {k.strip() for k in _raw_keys.split(',') if k.strip()} if _raw_keys else set()
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def require_api_key(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+    if not _VALID_KEYS:
+        return  # auth disabled
+    if creds is None or creds.credentials not in _VALID_KEYS:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid or missing API key')
+
+
+def _decode_bearer(creds: HTTPAuthorizationCredentials | None) -> dict:
+    if creds is None:
+        raise HTTPException(status_code=401, detail='Missing token')
+    try:
+        return _jwt_decode(creds.credentials)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+def require_jwt(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
+    """Require any valid JWT."""
+    return _decode_bearer(creds)
+
+
+def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
+    """Require admin or super_admin role."""
+    payload = _decode_bearer(creds)
+    role = payload.get('role', '')
+    if role not in ('admin', 'super_admin'):
+        # Legacy is_admin support
+        if not payload.get('is_admin'):
+            raise HTTPException(status_code=403, detail='Admin access required')
+    return payload
+
+
+def require_super_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
+    """Require super_admin role."""
+    payload = _decode_bearer(creds)
+    if payload.get('role') != 'super_admin':
+        raise HTTPException(status_code=403, detail='Super Admin access required')
+    return payload
+
+
+@app.get('/health')
+async def health():
+    return {'status': 'ok'}
+
+
+# ── Auth endpoints ─────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    user_id: str
+    password: str
+
+@app.post('/api/auth/login')
+async def auth_login(req: LoginRequest):
+    """Authenticate user, return JWT with role/worker/onboarding claims."""
+    if not req.user_id or not req.password:
+        raise HTTPException(status_code=400, detail='user_id and password required')
+
+    # Rate limit: max _LOGIN_MAX attempts per _LOGIN_WINDOW seconds per user_id
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(req.user_id, []) if now - t < _LOGIN_WINDOW]
+    if len(attempts) >= _LOGIN_MAX:
+        raise HTTPException(status_code=429, detail='Too many login attempts. Try again in 60 seconds.')
+    attempts.append(now)
+    _login_attempts[req.user_id] = attempts
+
+    # Look up user from users.json first
+    user = _find_user(req.user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail='Invalid credentials')
+
+    # Validate against SAJHA (keeps SAJHA as source of truth for its known users)
+    # If SAJHA returns 401, fall back to local users.json verification
+    # (covers users created via API that aren't in SAJHA's in-memory cache yet)
+    sajha_auth_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.post(
+                f'{SAJHA_BASE}/api/auth/login',
+                json={'user_id': req.user_id, 'password': req.password},
+            )
+            if r.status_code == 401:
+                # SAJHA doesn't know this user — fall back to local verification
+                if not _verify_password(req.password, user):
+                    raise HTTPException(status_code=401, detail='Invalid credentials')
+            elif not r.is_success:
+                r.raise_for_status()
+            else:
+                sajha_auth_ok = True
+    except HTTPException:
+        raise
+    except Exception as e:
+        # SAJHA unreachable — fall back to local verification
+        if not _verify_password(req.password, user):
+            raise HTTPException(status_code=502, detail=f'SAJHA unreachable: {e}')
+
+    if not user.get('enabled', True):
+        raise HTTPException(status_code=403, detail='Account disabled. Contact your administrator.')
+
+    role = _get_user_role(user)
+    worker_id = user.get('worker_id')
+    worker_name = None
+    if worker_id:
+        w = _find_worker(worker_id)
+        worker_name = w.get('name') if w else None
+    elif role == 'super_admin':
+        workers = _load_workers()
+        if workers:
+            worker_id = workers[0]['worker_id']
+            worker_name = workers[0].get('name')
+
+    is_admin = role in ('admin', 'super_admin')
+    token = _jwt_encode({
+        'user_id': req.user_id,
+        'role': role,
+        'is_admin': is_admin,
+        'worker_id': worker_id,
+        'display_name': user.get('display_name', user.get('user_name', req.user_id)),
+        'avatar_initials': user.get('avatar_initials', req.user_id[:2].upper()),
+        'onboarding_complete': user.get('onboarding_complete', True),
+        'exp': time.time() + 86400 * 7,
+    })
+
+    return {
+        'token': token,
+        'role': role,
+        'is_admin': is_admin,
+        'user_id': req.user_id,
+        'display_name': user.get('display_name', user.get('user_name', req.user_id)),
+        'worker_id': worker_id,
+        'worker_name': worker_name,
+        'onboarding_complete': user.get('onboarding_complete', True),
+    }
+
+
+@app.get('/api/auth/me')
+async def auth_me(payload: dict = Depends(require_jwt)):
+    return payload
+
+
+class OnboardingRequest(BaseModel):
+    display_name: str
+    new_password: str
+    confirm_password: str
+
+@app.post('/api/auth/onboarding')
+async def auth_onboarding(req: OnboardingRequest, payload: dict = Depends(require_jwt)):
+    if req.new_password != req.confirm_password:
+        raise HTTPException(status_code=400, detail='Passwords do not match')
+    if len(req.new_password) < 10:
+        raise HTTPException(status_code=400, detail='Password must be at least 10 characters')
+    if len(req.display_name.strip()) < 2:
+        raise HTTPException(status_code=400, detail='Display name must be at least 2 characters')
+
+    user_id = payload['user_id']
+    users = _load_users()
+    for u in users:
+        if u.get('user_id') == user_id:
+            u['display_name'] = req.display_name.strip()
+            parts = req.display_name.strip().split()
+            u['avatar_initials'] = ''.join(p[0].upper() for p in parts[:3])
+            u.pop('password', None)
+            ph = _hash_password(req.new_password)
+            if ph:
+                u['password_hash'] = ph
+            u['onboarding_complete'] = True
+            break
+    _save_users(users)
+    return {'ok': True}
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+@app.post('/api/auth/change-password')
+async def auth_change_password(req: ChangePasswordRequest, payload: dict = Depends(require_jwt)):
+    if len(req.new_password) < 10:
+        raise HTTPException(status_code=400, detail='Password must be at least 10 characters')
+    user_id = payload['user_id']
+    users = _load_users()
+    for u in users:
+        if u.get('user_id') == user_id:
+            if not _verify_password(req.current_password, u):
+                raise HTTPException(status_code=401, detail='Current password is incorrect')
+            u.pop('password', None)
+            ph = _hash_password(req.new_password)
+            if ph:
+                u['password_hash'] = ph
+            break
+    _save_users(users)
+    return {'ok': True}
+
+
+# ── Super Admin — Worker Management ──────────────────────────────────────────
+
+@app.get('/api/super/workers')
+async def super_list_workers(_: dict = Depends(require_super_admin)):
+    workers = _load_workers()
+    users = _load_users()
+    result = []
+    for w in workers:
+        wid = w['worker_id']
+        admins = [u for u in users if u.get('worker_id') == wid and _get_user_role(u) == 'admin']
+        members = [u for u in users if u.get('worker_id') == wid and _get_user_role(u) == 'user']
+        result.append({**w, 'admin_count': len(admins), 'user_count': len(members)})
+    return {'workers': result}
+
+
+class WorkerCreateRequest(BaseModel):
+    name: str
+    description: str = ''
+    system_prompt: str = ''
+    enabled_tools: list = ['*']
+    clone_from: Optional[str] = None
+
+@app.post('/api/super/workers', status_code=201)
+async def super_create_worker(req: WorkerCreateRequest, payload: dict = Depends(require_super_admin)):
+    wid = f'w-{uuid.uuid4().hex[:8]}'
+    new_worker = {
+        'worker_id': wid,
+        'name': req.name,
+        'description': req.description,
+        'created_by': payload['user_id'],
+        'created_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
+        'enabled': True,
+        'system_prompt': req.system_prompt,
+        'domain_data_path':  f'./data/workers/{wid}/domain_data',
+        'workflows_path':    f'./data/workers/{wid}/workflows/verified',
+        'my_workflows_path': f'./data/workers/{wid}/workflows/my',
+        'templates_path':    f'./data/workers/{wid}/templates',
+        'my_data_path':      f'./data/workers/{wid}/my_data',
+        'common_data_path':  './data/common',
+        'enabled_tools': req.enabled_tools,
+        'assigned_admins': [],
+        'assigned_users': [],
+    }
+    if req.clone_from:
+        src = _find_worker(req.clone_from)
+        if src:
+            new_worker['system_prompt'] = src.get('system_prompt', '')
+            new_worker['enabled_tools'] = src.get('enabled_tools', ['*'])
+
+    workers = _load_workers()
+    workers.append(new_worker)
+    _save_workers(workers)
+
+    if req.clone_from:
+        _clone_worker_folder(req.clone_from, wid)
+    else:
+        _seed_worker_folders(wid)
+
+    return new_worker
+
+
+@app.get('/api/super/workers/{worker_id}')
+async def super_get_worker(worker_id: str, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    return w
+
+
+class WorkerUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+    enabled_tools: Optional[list] = None
+    enabled: Optional[bool] = None
+    # REQ-13: Multi-agent
+    agent_mode: Optional[str] = None                 # "single" | "multi"
+    max_concurrent_subagents: Optional[int] = None   # clamped to [2, 8]
+    # REQ-14: Memory + budget + HITL
+    enable_memory: Optional[bool] = None
+    memory_ttl_days: Optional[int] = None
+    max_memories_per_query: Optional[int] = None
+    min_memory_similarity: Optional[float] = None
+    max_tokens_per_query: Optional[int] = None
+    hitl_triggers: Optional[list] = None
+    hitl_timeout_seconds: Optional[int] = None
+
+@app.put('/api/super/workers/{worker_id}')
+async def super_update_worker(worker_id: str, req: WorkerUpdateRequest, _: dict = Depends(require_super_admin)):
+    workers = _load_workers()
+    for w in workers:
+        if w['worker_id'] == worker_id:
+            if req.name is not None: w['name'] = req.name
+            if req.description is not None: w['description'] = req.description
+            if req.system_prompt is not None: w['system_prompt'] = req.system_prompt
+            if req.enabled_tools is not None: w['enabled_tools'] = req.enabled_tools
+            if req.enabled is not None: w['enabled'] = req.enabled
+            if req.agent_mode is not None: w['agent_mode'] = req.agent_mode
+            if req.max_concurrent_subagents is not None:
+                w['max_concurrent_subagents'] = max(2, min(8, req.max_concurrent_subagents))
+            if req.enable_memory is not None: w['enable_memory'] = req.enable_memory
+            if req.memory_ttl_days is not None: w['memory_ttl_days'] = req.memory_ttl_days
+            if req.max_memories_per_query is not None: w['max_memories_per_query'] = req.max_memories_per_query
+            if req.min_memory_similarity is not None: w['min_memory_similarity'] = req.min_memory_similarity
+            if req.max_tokens_per_query is not None: w['max_tokens_per_query'] = req.max_tokens_per_query
+            if req.hitl_triggers is not None: w['hitl_triggers'] = req.hitl_triggers
+            if req.hitl_timeout_seconds is not None: w['hitl_timeout_seconds'] = req.hitl_timeout_seconds
+            _save_workers(workers)
+            return w
+    raise HTTPException(status_code=404, detail='Worker not found')
+
+
+class DeleteWorkerRequest(BaseModel):
+    confirm_name: str
+
+@app.delete('/api/super/workers/{worker_id}')
+async def super_delete_worker(worker_id: str, req: DeleteWorkerRequest, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    if req.confirm_name != w['name']:
+        raise HTTPException(status_code=400, detail='Confirmation name does not match worker name')
+    # Delete folder tree
+    base = pathlib.Path(f'sajhamcpserver/data/workers/{worker_id}')
+    if _S3_MODE:
+        for rel in _storage.list_prefix(str(base)):
+            _storage.delete(str(base).rstrip('/') + '/' + rel)
+    elif base.exists():
+        shutil.rmtree(str(base))
+    # Remove from workers
+    workers = [x for x in _load_workers() if x['worker_id'] != worker_id]
+    _save_workers(workers)
+    # Unassign users
+    users = _load_users()
+    for u in users:
+        if u.get('worker_id') == worker_id:
+            u['worker_id'] = None
+    _save_users(users)
+    return {'ok': True}
+
+
+class AssignRequest(BaseModel):
+    user_id: str
+    role: str  # 'admin' | 'user'
+
+@app.post('/api/super/workers/{worker_id}/assign')
+async def super_assign_user(worker_id: str, req: AssignRequest, _: dict = Depends(require_super_admin)):
+    if req.role not in ('admin', 'user'):
+        raise HTTPException(status_code=400, detail='role must be admin or user')
+    if not _find_worker(worker_id):
+        raise HTTPException(status_code=404, detail='Worker not found')
+    if not _find_user(req.user_id):
+        raise HTTPException(status_code=404, detail='User not found')
+    _assign_user_to_worker(req.user_id, worker_id, role=req.role)
+    return {'ok': True}
+
+
+@app.delete('/api/super/workers/{worker_id}/assign/{user_id}')
+async def super_unassign_user(worker_id: str, user_id: str, _: dict = Depends(require_super_admin)):
+    _assign_user_to_worker(user_id, None)
+    return {'ok': True}
+
+
+# ── Super Admin — User Management ─────────────────────────────────────────────
+
+@app.get('/api/super/users')
+async def super_list_users(_: dict = Depends(require_super_admin)):
+    return {'users': _load_users()}
+
+
+class UserCreateRequest(BaseModel):
+    user_id: str
+    display_name: str
+    email: str = ''
+    password: str
+    role: str = 'user'
+    worker_id: Optional[str] = None
+
+@app.post('/api/super/users', status_code=201)
+async def super_create_user(req: UserCreateRequest, _: dict = Depends(require_super_admin)):
+    if req.role not in ('admin', 'user'):
+        raise HTTPException(status_code=400, detail='role must be admin or user')
+    users = _load_users()
+    if any(u['user_id'] == req.user_id for u in users):
+        raise HTTPException(status_code=409, detail='user_id already exists')
+
+    parts = req.display_name.strip().split()
+    initials = ''.join(p[0].upper() for p in parts[:3])
+    ph = _hash_password(req.password)
+    now = __import__('datetime').datetime.utcnow().isoformat() + 'Z'
+    new_user = {
+        'user_id': req.user_id,
+        'user_name': req.display_name,
+        'display_name': req.display_name,
+        'avatar_initials': initials,
+        'password_hash': ph,
+        'role': req.role,
+        'worker_id': req.worker_id,
+        'tools': ['*'],
+        'enabled': True,
+        'onboarding_complete': False,
+        'email': req.email,
+        'created_at': now,
+        'last_login': None,
+    }
+    users.append(new_user)
+    _save_users(users)
+    # Sync worker's assigned_users if worker_id is set
+    if req.worker_id:
+        _assign_user_to_worker(req.user_id, req.worker_id, role=req.role)
+    return new_user
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+    worker_id: Optional[str] = None
+    enabled: Optional[bool] = None
+
+@app.put('/api/super/users/{user_id}')
+async def super_update_user(user_id: str, req: UserUpdateRequest, _: dict = Depends(require_super_admin)):
+    users = _load_users()
+    for u in users:
+        if u['user_id'] == user_id:
+            if req.display_name is not None:
+                u['display_name'] = req.display_name
+                parts = req.display_name.strip().split()
+                u['avatar_initials'] = ''.join(p[0].upper() for p in parts[:3])
+            if req.email is not None: u['email'] = req.email
+            if req.role is not None: u['role'] = req.role
+            if req.worker_id is not None:
+                _assign_user_to_worker(user_id, req.worker_id, role=req.role)
+                # reload since _assign_user_to_worker saved
+                users = _load_users()
+                u = next((x for x in users if x['user_id'] == user_id), u)
+            if req.enabled is not None: u['enabled'] = req.enabled
+            _save_users(users)
+            return u
+    raise HTTPException(status_code=404, detail='User not found')
+
+
+@app.delete('/api/super/users/{user_id}')
+async def super_delete_user(user_id: str, _: dict = Depends(require_super_admin)):
+    # Remove from worker's assigned_users before deleting (G-09)
+    _assign_user_to_worker(user_id, None)
+    users = [u for u in _load_users() if u['user_id'] != user_id]
+    _save_users(users)
+    return {'ok': True}
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: Optional[str] = None  # If supplied, use it; otherwise generate a temp password
+
+@app.post('/api/super/users/{user_id}/reset-password')
+async def super_reset_password(user_id: str, req: ResetPasswordRequest = ResetPasswordRequest(),
+                               _: dict = Depends(require_super_admin)):
+    import secrets, string
+    if req.new_password:
+        if len(req.new_password) < 10:
+            raise HTTPException(status_code=400, detail='Password must be at least 10 characters')
+        new_pwd = req.new_password
+        force_onboarding = False
+    else:
+        new_pwd = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+        force_onboarding = True   # temp password → force re-onboarding so user sets their own
+    users = _load_users()
+    for u in users:
+        if u['user_id'] == user_id:
+            ph = _hash_password(new_pwd)
+            if ph: u['password_hash'] = ph
+            u.pop('password', None)
+            u['onboarding_complete'] = not force_onboarding
+            break
+    _save_users(users)
+    return {'temp_password': new_pwd, 'onboarding_complete': not force_onboarding}
+
+
+# ── Super Admin — LLM Provider Config ─────────────────────────────────────────
+
+_LLM_CONFIG_FILE = pathlib.Path('sajhamcpserver/config/llm_config.json')
+
+_LLM_DEFAULTS = {
+    'anthropic':  {'model': 'claude-sonnet-4-20250514', 'max_tokens': 8192},
+    'xai':        {'model': 'grok-3',                   'max_tokens': 8192},
+    'huggingface':{'model': 'meta-llama/Llama-3.3-70B-Instruct', 'max_tokens': 4096},
+    'bedrock':    {'model_id': 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+                   'region': 'us-east-1',               'max_tokens': 8192},
+}
+
+def _mask_key(key: str) -> str:
+    """Return masked version showing only last 4 chars."""
+    if not key or len(key) < 8:
+        return '••••' if key else ''
+    return '••••' + key[-4:]
+
+def _read_llm_config() -> dict:
+    """Read LLM config — Postgres first (app_config key), JSON file fallback."""
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    cfg = pool.submit(asyncio.run, _db_repo.get_app_config('llm_config')).result(timeout=5)
+            else:
+                cfg = loop.run_until_complete(_db_repo.get_app_config('llm_config'))
+            if cfg:
+                return cfg
+        except Exception:
+            pass
+    if _LLM_CONFIG_FILE.exists():
+        try:
+            return json.loads(_LLM_CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {'provider': os.getenv('LLM_PROVIDER', 'anthropic')}
+
+def _write_llm_config(cfg: dict) -> None:
+    """Write LLM config — Postgres primary, JSON file kept in sync."""
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(asyncio.run, _db_repo.set_app_config('llm_config', cfg)).result(timeout=5)
+            else:
+                loop.run_until_complete(_db_repo.set_app_config('llm_config', cfg))
+        except Exception:
+            pass
+    # Keep JSON in sync as a readable backup
+    try:
+        _LLM_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+
+
+@app.get('/api/super/llm-config')
+async def get_llm_config(_: dict = Depends(require_super_admin)):
+    """Return current LLM config with API keys masked."""
+    cfg = _read_llm_config()
+    # Mask API keys in response
+    masked = dict(cfg)
+    for prov in ('anthropic', 'xai', 'huggingface'):
+        if prov in masked and masked[prov].get('api_key'):
+            masked[prov] = dict(masked[prov])
+            masked[prov]['api_key_masked'] = _mask_key(masked[prov]['api_key'])
+            masked[prov]['api_key'] = ''  # never send raw key back
+    return masked
+
+
+class LlmProviderSettings(BaseModel):
+    api_key: str | None = None
+    api_key_masked: str | None = None  # ignored on write
+    model: str | None = None
+    max_tokens: int | None = None
+
+class LlmBedrockSettings(BaseModel):
+    model_id: str | None = None
+    region: str | None = None
+    max_tokens: int | None = None
+
+class LlmConfigRequest(BaseModel):
+    provider: str
+    anthropic: LlmProviderSettings | None = None
+    xai: LlmProviderSettings | None = None
+    huggingface: LlmProviderSettings | None = None
+    bedrock: LlmBedrockSettings | None = None
+
+
+@app.put('/api/super/llm-config')
+async def put_llm_config(req: LlmConfigRequest, _: dict = Depends(require_super_admin)):
+    """Save LLM config and hot-reload the agent LLM."""
+    valid = ('anthropic', 'xai', 'huggingface', 'bedrock')
+    if req.provider not in valid:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {valid}")
+
+    existing = _read_llm_config()
+
+    def _merge_prov(prov_name: str, incoming, key_field='api_key'):
+        prev = existing.get(prov_name, {})
+        defaults = _LLM_DEFAULTS.get(prov_name, {})
+        merged = {**defaults, **prev}
+        if incoming is None:
+            return merged
+        d = incoming.dict(exclude_none=True)
+        d.pop('api_key_masked', None)
+        # If api_key is empty string, keep existing key
+        if key_field in d and not d[key_field]:
+            d.pop(key_field)
+        merged.update(d)
+        return merged
+
+    cfg = {
+        'provider': req.provider,
+        'anthropic':   _merge_prov('anthropic',   req.anthropic),
+        'xai':         _merge_prov('xai',         req.xai),
+        'huggingface': _merge_prov('huggingface', req.huggingface),
+        'bedrock':     _merge_prov('bedrock',     req.bedrock, key_field=''),
+    }
+    _write_llm_config(cfg)
+
+    # Hot-reload agent LLM
+    try:
+        from agent.agent import reload_llm
+        new_provider = reload_llm()
+        return {'status': 'ok', 'active_provider': new_provider}
+    except Exception as exc:
+        # Config saved but reload failed — return error so UI can show it
+        raise HTTPException(status_code=500, detail=f"Config saved but LLM reload failed: {exc}")
+
+
+# ── Admin — Own Worker Config ──────────────────────────────────────────────────
+
+def _get_admin_worker(payload: dict) -> dict:
+    role = payload.get('role', '')
+    if role == 'super_admin':
+        wid = payload.get('worker_id')
+        workers = _load_workers()
+        return _find_worker(wid) if wid else (workers[0] if workers else None)
+    elif role == 'admin':
+        wid = payload.get('worker_id')
+        w = _find_worker(wid) if wid else None
+        if not w:
+            raise HTTPException(status_code=404, detail='No worker assigned to this admin')
+        return w
+    else:
+        raise HTTPException(status_code=403, detail='Admin access required')
+
+
+@app.get('/api/mcp/tools')
+async def mcp_tools_list(_: dict = Depends(require_admin)):
+    """Return tool list built from SAJHA config/tools JSON files — no live SAJHA needed."""
+    tools_dir = pathlib.Path('sajhamcpserver/config/tools')
+    tools = []
+    for f in sorted(tools_dir.glob('*.json')):
+        try:
+            cfg = json.loads(f.read_text())
+        except Exception:
+            continue
+        name = cfg.get('name') or f.stem
+        meta = cfg.get('metadata', {})
+        tools.append({
+            'name': name,
+            'description': cfg.get('description', ''),
+            'category': meta.get('category', _infer_category(name)),
+            'enabled': cfg.get('enabled', True),
+            'tags': meta.get('tags', []),
+        })
+    return {'tools': tools}
+
+
+def _infer_category(name: str) -> str:
+    prefixes = {
+        'edgar_': 'SEC / EDGAR',
+        'iris_': 'IRIS CCR',
+        'osfi_': 'OSFI Regulatory',
+        'tavily_': 'Web Search',
+        'ir_': 'Investor Relations',
+        'duckdb_': 'DuckDB Analytics',
+        'sqlselect_': 'SQL / Data',
+        'msdoc_': 'Documents',
+        'olap_': 'OLAP Analytics',
+        'sharepoint_': 'SharePoint',
+        'get_': 'Market Risk',
+        'iris_': 'IRIS CCR',
+        'workflow_': 'Workflows',
+        'md_': 'Markdown / Docs',
+    }
+    for prefix, cat in prefixes.items():
+        if name.startswith(prefix):
+            return cat
+    return 'General'
+
+
+@app.get('/api/admin/worker')
+async def admin_get_worker(payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    return w
+
+
+class PromptUpdateRequest(BaseModel):
+    system_prompt: str
+
+@app.put('/api/admin/worker/prompt')
+async def admin_update_prompt(req: PromptUpdateRequest, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    workers = _load_workers()
+    for wk in workers:
+        if wk['worker_id'] == w['worker_id']:
+            wk['system_prompt'] = req.system_prompt
+            break
+    _save_workers(workers)
+    return {'ok': True}
+
+
+class ToolsUpdateRequest(BaseModel):
+    enabled_tools: list
+
+@app.put('/api/admin/worker/tools')
+async def admin_update_tools(req: ToolsUpdateRequest, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    workers = _load_workers()
+    for wk in workers:
+        if wk['worker_id'] == w['worker_id']:
+            wk['enabled_tools'] = req.enabled_tools
+            break
+    _save_workers(workers)
+    return {'ok': True}
+
+
+@app.get('/api/admin/worker/users')
+async def admin_list_worker_users(payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    wid = w['worker_id']
+    users = [u for u in _load_users() if u.get('worker_id') == wid]
+    return {'users': users}
+
+
+@app.put('/api/admin/worker')
+async def admin_update_worker(req: Request, payload: dict = Depends(require_admin)):
+    """Admin: update own worker name, description, system_prompt."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    data = await req.json()
+    workers = _load_workers()
+    for wk in workers:
+        if wk['worker_id'] == w['worker_id']:
+            for field in ('name', 'description', 'system_prompt'):
+                if field in data:
+                    wk[field] = data[field]
+            break
+    _save_workers(workers)
+    return {'ok': True}
+
+
+@app.post('/api/admin/worker/users', status_code=201)
+async def admin_create_worker_user(req: Request, payload: dict = Depends(require_admin)):
+    """Admin: create a user scoped to their worker."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    data = await req.json()
+    user_id = data.get('user_id', '').strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail='user_id required')
+    users = _load_users()
+    if any(u['user_id'] == user_id for u in users):
+        raise HTTPException(status_code=409, detail='User already exists')
+    import bcrypt as _bcrypt
+    password = data.get('password', 'ChangeMe2025!')
+    hashed = _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+    new_user = {
+        'user_id': user_id,
+        'display_name': data.get('display_name', user_id),
+        'role': 'user',
+        'worker_id': w['worker_id'],
+        'password_hash': hashed,
+        'enabled': True,
+        'onboarding_complete': False,
+    }
+    users.append(new_user)
+    _save_users(users)
+    return {'ok': True, 'user_id': user_id}
+
+
+@app.put('/api/admin/worker/users/{user_id}')
+async def admin_update_worker_user(user_id: str, req: Request, payload: dict = Depends(require_admin)):
+    """Admin: enable/disable a user in their worker."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    data = await req.json()
+    users = _load_users()
+    for u in users:
+        if u['user_id'] == user_id and u.get('worker_id') == w['worker_id']:
+            if 'enabled' in data:
+                u['enabled'] = bool(data['enabled'])
+            break
+    else:
+        raise HTTPException(status_code=404, detail='User not found in this worker')
+    _save_users(users)
+    return {'ok': True}
+
+
+@app.post('/api/admin/worker/users/{user_id}/reset-password')
+async def admin_reset_worker_user_password(user_id: str, payload: dict = Depends(require_admin)):
+    """Admin: reset a user's password (scoped to their worker)."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    import secrets as _secrets, bcrypt as _bcrypt
+    tmp_password = 'Tmp' + _secrets.token_urlsafe(8) + '!'
+    hashed = _bcrypt.hashpw(tmp_password.encode(), _bcrypt.gensalt()).decode()
+    users = _load_users()
+    for u in users:
+        if u['user_id'] == user_id and u.get('worker_id') == w['worker_id']:
+            u['password_hash'] = hashed
+            u['onboarding_complete'] = False
+            break
+    else:
+        raise HTTPException(status_code=404, detail='User not found in this worker')
+    _save_users(users)
+    return {'ok': True, 'temp_password': tmp_password}
+
+
+@app.delete('/api/admin/worker/users/{user_id}')
+async def admin_delete_worker_user(user_id: str, payload: dict = Depends(require_admin)):
+    """Admin: delete a user scoped to their worker. Cannot delete self."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    if user_id == payload['user_id']:
+        raise HTTPException(status_code=400, detail='Cannot delete your own account')
+    users = _load_users()
+    target = next((u for u in users if u['user_id'] == user_id and u.get('worker_id') == w['worker_id']), None)
+    if not target:
+        raise HTTPException(status_code=404, detail='User not found in this worker')
+    users = [u for u in users if u['user_id'] != user_id]
+    _save_users(users)
+    return {'ok': True}
+
+
+# ── File upload ────────────────────────────────────────────────────────────────
+
+_UPLOAD_ALLOWED_EXT = {'pdf', 'docx', 'xlsx', 'csv', 'txt', 'parquet', 'md', 'json', 'png', 'jpg', 'jpeg', 'py'}
+_UPLOAD_MAX_MB = 20
+_UPLOAD_CHUNK_SIZE = 65536        # 64 KB streaming chunk (REQ-11)
+_UPLOAD_MAX_BYTES  = 20 * 1024 * 1024  # 20 MB hard limit (REQ-11)
+
+
+async def _stream_upload(file: UploadFile, dest: pathlib.Path) -> int:
+    """Stream upload to disk or S3. Returns bytes written.
+    Raises HTTP 413 if file exceeds 20 MB. Cleans up partial file on error. (REQ-11, REQ-15)"""
+    if _S3_MODE:
+        buf = b''
+        while True:
+            chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > _UPLOAD_MAX_BYTES:
+                raise HTTPException(status_code=413, detail='File exceeds 20 MB limit')
+        _storage.write_bytes(str(dest), buf)
+        return len(buf)
+    # Local mode — original implementation
+    bytes_written = 0
+    try:
+        async with aiofiles.open(dest, 'wb') as f:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                await f.write(chunk)
+                bytes_written += len(chunk)
+                if bytes_written > _UPLOAD_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail='File exceeds 20 MB limit')
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f'Upload failed: {exc}')
+    return bytes_written
+
+@app.post('/api/files/upload')
+async def upload_file(file: UploadFile = File(...), payload: dict = Depends(require_jwt)):
+    """Upload a file to the authenticated user's my_data directory (REQ-MD-01).
+
+    Saves directly to the worker's my_data/{user_id}/ path — no SAJHA proxy needed.
+    """
+    from datetime import datetime, timezone as _tz
+    try:
+        user_id = payload.get('user_id', '')
+        user    = _find_user(user_id)
+        worker  = (_resolve_worker_for_user(user, None) if user else None)
+        if not worker:
+            raise HTTPException(status_code=404, detail='No worker assigned to this user')
+
+        # Resolve per-user my_data directory (REQ-MD-01)
+        raw_my_data = worker.get('my_data_path', './data/uploads')
+        if _S3_MODE:
+            # S3 mode: use raw relative path WITHOUT the 'sajhamcpserver/' prefix so
+            # _key() produces 'data/workers/.../my_data/user_id' — matching path_resolve().
+            # pathlib.Path() / .resolve() would prepend the container cwd and corrupt the key.
+            user_dir = raw_my_data.rstrip('/') + '/' + user_id
+        else:
+            my_data_dir = (pathlib.Path('sajhamcpserver') / raw_my_data.lstrip('./')).resolve()
+            user_dir = my_data_dir / user_id
+            user_dir.mkdir(parents=True, exist_ok=True)
+
+        # Validate extension
+        ext = file.filename.rsplit('.', 1)[-1].lower() if file.filename and '.' in file.filename else ''
+        if ext not in _UPLOAD_ALLOWED_EXT:
+            raise HTTPException(status_code=400,
+                                detail=f'Unsupported file type. Allowed: {", ".join(sorted(_UPLOAD_ALLOWED_EXT))}')
+
+        # Safe filename
+        safe_name = pathlib.Path(file.filename).name
+        dest = (user_dir.rstrip('/') + '/' + safe_name) if _S3_MODE else (user_dir / safe_name)
+        _dest_exists = _storage.exists(str(dest)) if _S3_MODE else dest.exists()
+        if _dest_exists:
+            ts = datetime.now(_tz.utc).strftime('%Y%m%d_%H%M%S')
+            stem, suffix = safe_name.rsplit('.', 1) if '.' in safe_name else (safe_name, '')
+            safe_name = f'{stem}_{ts}.{suffix}' if suffix else f'{stem}_{ts}'
+            dest = (user_dir.rstrip('/') + '/' + safe_name) if _S3_MODE else (user_dir / safe_name)
+
+        size_bytes = await _stream_upload(file, dest)
+        _build_and_sync(str(user_dir))   # refresh tree cache immediately
+        now_iso = datetime.now(_tz.utc).isoformat()
+        if not _S3_MODE:
+            stat = dest.stat()
+            size_bytes = stat.st_size
+            now_iso = datetime.fromtimestamp(stat.st_mtime, tz=_tz.utc).isoformat()
+        # path: in S3 mode strip leading './' so client sees 'data/workers/.../hello_test.py'
+        rel_path = (dest.lstrip('./') if _S3_MODE
+                    else str(dest.relative_to(pathlib.Path('sajhamcpserver').resolve())).replace('\\', '/'))
+        return JSONResponse(content={
+            'success': True,
+            'filename': safe_name,
+            'path': rel_path,
+            'size_bytes': size_bytes,
+            'uploaded_at': now_iso,
+            'file_type': ext,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500, content={'success': False, 'error': str(e)})
+
+
+def _read_metadata(worker_id: str = '') -> dict:
+    """Return {filename: last_used_iso} — Postgres primary, JSON file fallback."""
+    if _DB_ENABLED and worker_id:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, _db_repo.get_workflow_metadata(worker_id)).result(timeout=5)
+            return loop.run_until_complete(_db_repo.get_workflow_metadata(worker_id))
+        except Exception:
+            pass
+    try:
+        meta_file = _worker_metadata_file(worker_id)
+        raw = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+        # Normalise: values may be ISO strings or {"last_used": "..."} dicts
+        return {
+            k: (v.get('last_used') if isinstance(v, dict) else v)
+            for k, v in raw.items()
+        }
+    except Exception:
+        return {}
+
+
+def _write_metadata(data: dict, worker_id: str = ''):
+    """Persist metadata — Postgres primary, JSON file kept in sync (local dev)."""
+    # JSON backup (local dev / fallback) — per-worker file
+    try:
+        meta_file = _worker_metadata_file(worker_id)
+        meta_file.parent.mkdir(parents=True, exist_ok=True)
+        meta_file.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+def _safe_filename(filename: str) -> str:
+    name = pathlib.Path(filename).name
+    if not name.endswith('.md') or '/' in filename or '..' in filename:
+        raise HTTPException(status_code=400, detail='filename must be a plain .md filename')
+    return name
+
+
+# ── Workspace files ────────────────────────────────────────────────────────────
+
+@app.get('/api/workspace/files')
+async def list_workspace_files(payload: dict = Depends(require_jwt)):
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    raw = worker.get('my_data_path', './data/uploads')
+    if _S3_MODE:
+        user_dir = raw.rstrip('/') + '/' + payload['user_id']
+    else:
+        base = pathlib.Path('sajhamcpserver')
+        user_dir = (base / raw.lstrip('./')).resolve() / payload['user_id']
+    files = []
+    if _S3_MODE:
+        for rel in _storage.list_prefix(str(user_dir)):
+            if not rel.startswith('.') and '/' not in rel:
+                files.append({'name': rel, 'size': 0, 'modified': None})
+    else:
+        user_dir.mkdir(parents=True, exist_ok=True)
+        for f in sorted(user_dir.iterdir()):
+            if f.is_file() and not f.name.startswith('.'):
+                files.append({'name': f.name, 'size': f.stat().st_size,
+                               'modified': f.stat().st_mtime})
+    return {'files': files}
+
+
+# ── Workflows ──────────────────────────────────────────────────────────────────
+
+@app.get('/api/workflows')
+async def list_workflows(payload: dict = Depends(require_jwt)):
+    import traceback as _tb
+    try:
+        user = _find_user(payload['user_id'])
+        worker = _resolve_worker_for_user(user) if user else None
+        if not worker:
+            raise HTTPException(status_code=404, detail='No worker assigned to this user')
+        meta = _read_metadata(worker.get('worker_id', ''))
+        seen: set = set()
+        workflows = []
+        for section in ('verified_workflows', 'my_workflows'):
+            wf_dir = _resolve_worker_path(worker, section)
+            if _S3_MODE:
+                for rel in _storage.list_prefix(str(wf_dir)):
+                    if rel.endswith('.md') and '/' not in rel and rel not in seen:
+                        seen.add(rel)
+                        mv = meta.get(rel)
+                        workflows.append({
+                            'filename': rel,
+                            'name': rel.rsplit('.', 1)[0].replace('_', ' ').title(),
+                            'size': 0,
+                            'last_used': mv.get('last_used') if isinstance(mv, dict) else mv,
+                        })
+            else:
+                if wf_dir.exists():
+                    for f in sorted(wf_dir.iterdir()):
+                        if f.is_file() and f.suffix == '.md' and f.name not in seen:
+                            seen.add(f.name)
+                            mv = meta.get(f.name)
+                            workflows.append({
+                                'filename': f.name,
+                                'name': f.stem.replace('_', ' ').title(),
+                                'size': f.stat().st_size,
+                                'last_used': mv.get('last_used') if isinstance(mv, dict) else mv,
+                            })
+        workflows.sort(key=lambda w: (w['last_used'] or ''), reverse=True)
+        return {'workflows': workflows}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail=f'list_workflows error: {_tb.format_exc()[-2000:]}')
+
+
+@app.get('/api/workflows/{filename}')
+async def get_workflow(filename: str, payload: dict = Depends(require_jwt)):
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    name = _safe_filename(filename)
+    # Check verified_workflows first, then my_workflows (BUG-NEW-007 fix)
+    for section in ('verified_workflows', 'my_workflows'):
+        wf_dir = _resolve_worker_path(worker, section)
+        path = wf_dir / name
+        _exists = _storage.exists(str(path)) if _S3_MODE else path.exists()
+        if _exists:
+            content = _storage.read_text(str(path)) if _S3_MODE else path.read_text()
+            return {'filename': name, 'content': content}
+    raise HTTPException(status_code=404, detail='Workflow not found')
+
+
+class WorkflowCreate(BaseModel):
+    filename: str
+    content: str
+
+@app.post('/api/workflows', status_code=201)
+async def create_workflow(req: WorkflowCreate, payload: dict = Depends(require_jwt)):
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    name = _safe_filename(req.filename)
+    my_wf_dir = _resolve_worker_path(worker, 'my_workflows')
+    wf_path = my_wf_dir / name
+    if _S3_MODE:
+        _storage.write_text(str(wf_path), req.content)
+    else:
+        wf_path.write_text(req.content)
+    return {'filename': name, 'ok': True}
+
+
+@app.delete('/api/workflows/{filename}')
+async def delete_workflow(filename: str, payload: dict = Depends(require_jwt)):
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    name = _safe_filename(filename)
+    my_wf_dir = _resolve_worker_path(worker, 'my_workflows')
+    path = my_wf_dir / name
+    _exists = _storage.exists(str(path)) if _S3_MODE else path.exists()
+    if not _exists:
+        raise HTTPException(status_code=404, detail='Workflow not found')
+    if _S3_MODE:
+        _storage.delete(str(path))
+    else:
+        path.unlink()
+    worker_id = worker.get('worker_id', '')
+    if _DB_ENABLED and worker_id:
+        await _db_repo.delete_workflow_metadata(worker_id, name)
+    else:
+        meta = _read_metadata()
+        meta.pop(name, None)
+        _write_metadata(meta)
+    return {'ok': True}
+
+
+@app.patch('/api/workflows/{filename}/used')
+async def mark_workflow_used(filename: str, payload: dict = Depends(require_jwt)):
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    name = _safe_filename(filename)
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    worker_id = worker.get('worker_id', '')
+    if _DB_ENABLED and worker_id:
+        await _db_repo.set_workflow_last_used(worker_id, name, now_iso)
+    else:
+        meta = _read_metadata()
+        meta[name] = now_iso
+        _write_metadata(meta)
+    return {'ok': True}
+
+
+# ── FileTree API — worker-scoped (G-03) ────────────────────────────────────────
+
+def _fs_worker(payload: dict) -> dict:
+    """Resolve the worker for an fs endpoint caller. Any authenticated user allowed."""
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+    return worker
+
+
+def _resolve_fs_path(worker: dict, user_id: str, section: str, rel: str = ''):
+    """Resolve an fs section path. 'uploads' maps to my_data/{user_id}/ (REQ-MD-01).
+    Returns str in S3 mode (raw relative path matching path_resolve() key space),
+    pathlib.Path in local mode (backward-compatible).
+    """
+    if section == 'uploads':
+        raw = worker.get('my_data_path', './data/uploads')
+        if _S3_MODE:
+            # Use raw relative path without sajhamcpserver/ prefix so _key() produces
+            # 'data/workers/.../my_data/user_id' — matching path_resolve() output.
+            root_str = raw.rstrip('/') + '/' + user_id
+            if rel:
+                # Traverse-guard: normalise separators, ensure rel stays within root
+                rel_clean = rel.lstrip('/')
+                if '..' in rel_clean.split('/'):
+                    raise HTTPException(status_code=400, detail='Path traversal not allowed')
+                return root_str.rstrip('/') + '/' + rel_clean
+            return root_str
+        base = pathlib.Path('sajhamcpserver')
+        root = (base / raw.lstrip('./')).resolve() / user_id
+        root.mkdir(parents=True, exist_ok=True)
+        if rel:
+            full = (root / rel).resolve()
+            if not str(full).startswith(str(root)):
+                raise HTTPException(status_code=400, detail='Path traversal not allowed')
+            return full
+        return root
+    return _resolve_worker_path(worker, section, rel)
+
+
+@app.get('/api/fs/quota')
+async def fs_quota(payload: dict = Depends(require_jwt)):
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    my_data_root = _resolve_fs_path(worker, uid, 'uploads')
+    if _S3_MODE:
+        keys = _storage.list_prefix(str(my_data_root))
+        used_bytes = sum(_storage.get_size(str(my_data_root).rstrip('/') + '/' + k) for k in keys)
+    else:
+        used_bytes = sum(f.stat().st_size for f in my_data_root.rglob('*') if f.is_file()) if my_data_root.exists() else 0
+    # Default quota: 5 GB. Could be configurable via properties.
+    limit_bytes = 5 * 1024 * 1024 * 1024
+    used_pct = round((used_bytes / limit_bytes) * 100, 2) if limit_bytes > 0 else 0
+    return {'used_bytes': used_bytes, 'limit_bytes': limit_bytes, 'used_pct': used_pct}
+
+
+@app.get('/api/fs/{section}/tree')
+async def fs_tree(section: str, payload: dict = Depends(require_jwt)):
+    worker = _fs_worker(payload)
+    root = _resolve_fs_path(worker, payload['user_id'], section)
+    idx = get_index(str(root))
+    return idx
+
+
+@app.get('/api/fs/{section}/file')
+async def fs_file(section: str, path: str = '', payload: dict = Depends(require_jwt)):
+    worker = _fs_worker(payload)
+    if not path:
+        raise HTTPException(status_code=400, detail='path required')
+    full = _resolve_fs_path(worker, payload['user_id'], section, path)
+    if _S3_MODE:
+        if not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='File not found')
+    else:
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail='File not found')
+    content_bytes = _storage.read_bytes(str(full)) if _S3_MODE else full.read_bytes()
+    try:
+        text = content_bytes.decode('utf-8')
+        return {'path': path, 'encoding': 'utf-8', 'content': text}
+    except UnicodeDecodeError:
+        return {'path': path, 'encoding': 'base64', 'content': base64.b64encode(content_bytes).decode('ascii')}
+
+
+@app.post('/api/fs/{section}/upload')
+async def fs_upload(
+    section: str,
+    path: str = '',
+    batch_id: str = '',
+    file: UploadFile = File(...),
+    payload: dict = Depends(require_jwt),
+):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    folder = _resolve_fs_path(worker, uid, section, path) if path else root
+    if not _S3_MODE:
+        folder.mkdir(parents=True, exist_ok=True)
+    safe_fname = pathlib.Path(file.filename).name
+    dest = (str(folder).rstrip('/') + '/' + safe_fname) if _S3_MODE else (folder / safe_fname)
+    await _stream_upload(file, dest)
+    if not batch_id:
+        _build_and_sync(str(root))
+    if _S3_MODE:
+        rel_path = str(dest)[len(str(root).rstrip('/')) + 1:]
+    else:
+        rel_path = str(dest.relative_to(root)).replace('\\', '/')
+    return {'ok': True, 'path': rel_path}
+
+
+class FsUpdateRequest(BaseModel):
+    path: str
+    content: str
+
+@app.patch('/api/fs/{section}/file')
+async def fs_update_file(section: str, req: FsUpdateRequest, payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    full = _resolve_fs_path(worker, uid, section, req.path)
+    if _S3_MODE:
+        _storage.write_text(str(full), req.content)
+    else:
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(req.content, encoding='utf-8')
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+class FsMkdirRequest(BaseModel):
+    path: str
+
+@app.post('/api/fs/{section}/folder')
+async def fs_mkdir(section: str, req: FsMkdirRequest, payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    full = _resolve_fs_path(worker, uid, section, req.path)
+    if not _S3_MODE:
+        full.mkdir(parents=True, exist_ok=True)
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+class FsMoveRequest(BaseModel):
+    src: str
+    dst: str
+
+@app.post('/api/fs/{section}/move')
+async def fs_move(section: str, req: FsMoveRequest, payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    src_full = _resolve_fs_path(worker, uid, section, req.src)
+    dst_full = _resolve_fs_path(worker, uid, section, req.dst)
+    _src_exists = _storage.exists(str(src_full)) if _S3_MODE else src_full.exists()
+    if not _src_exists:
+        raise HTTPException(status_code=404, detail='Source not found')
+    if _S3_MODE:
+        _storage.copy(str(src_full), str(dst_full))
+        _storage.delete(str(src_full))
+    else:
+        dst_full.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_full), str(dst_full))
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+class FsRenameRequest(BaseModel):
+    path: str
+    new_name: str
+
+@app.post('/api/fs/{section}/rename')
+async def fs_rename(section: str, req: FsRenameRequest, payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    full = _resolve_fs_path(worker, uid, section, req.path)
+    _full_exists = _storage.exists(str(full)) if _S3_MODE else full.exists()
+    if not _full_exists:
+        raise HTTPException(status_code=404, detail='Not found')
+    new_name = pathlib.Path(req.new_name).name
+    new_full = full.parent / new_name
+    if _S3_MODE:
+        _storage.copy(str(full), str(new_full))
+        _storage.delete(str(full))
+    else:
+        full.rename(new_full)
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+class FsCopyRequest(BaseModel):
+    src_path: str
+    dest_section: str
+    dest_path: str
+
+@app.post('/api/fs/{section}/copy')
+async def fs_copy(section: str, req: FsCopyRequest, payload: dict = Depends(require_jwt)):
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    if req.dest_section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Destination section is read-only')
+    src_full = _resolve_fs_path(worker, uid, section, req.src_path)
+    if _S3_MODE:
+        if not _storage.exists(str(src_full)):
+            raise HTTPException(status_code=404, detail='Source file not found')
+    else:
+        if not src_full.exists() or not src_full.is_file():
+            raise HTTPException(status_code=404, detail='Source file not found')
+    dst_full = _resolve_fs_path(worker, uid, req.dest_section, req.dest_path)
+    _dst_exists = _storage.exists(str(dst_full)) if _S3_MODE else dst_full.exists()
+    if _dst_exists:
+        raise HTTPException(status_code=409, detail='Destination already exists')
+    if _S3_MODE:
+        _storage.copy(str(src_full), str(dst_full))
+    else:
+        dst_full.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src_full), str(dst_full))
+    dst_root = _resolve_fs_path(worker, uid, req.dest_section)
+    _build_and_sync(str(dst_root))
+    return {'ok': True, 'dest_path': req.dest_path}
+
+
+class FsBatchDeleteRequest(BaseModel):
+    paths: list
+    include_dirs: bool = False
+
+@app.post('/api/fs/{section}/batch-delete')
+async def fs_batch_delete(section: str, req: FsBatchDeleteRequest, payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    deleted = []
+    errors = []
+    for p in req.paths:
+        try:
+            full = _resolve_fs_path(worker, uid, section, p)
+            if _S3_MODE:
+                # In S3: check if it's a "folder" (has keys under prefix) or a file
+                full_str = str(full)
+                prefix_keys = _storage.list_prefix(full_str)
+                is_s3_folder = len(prefix_keys) > 0
+                is_s3_file = not is_s3_folder and _storage.exists(full_str)
+                if not is_s3_folder and not is_s3_file:
+                    errors.append({'path': p, 'error': 'Not found'})
+                    continue
+                if is_s3_folder:
+                    if not req.include_dirs:
+                        errors.append({'path': p, 'error': 'Is a directory; set include_dirs=true'})
+                        continue
+                    for rel in prefix_keys:
+                        _storage.delete(full_str.rstrip('/') + '/' + rel)
+                else:
+                    _storage.delete(full_str)
+            else:
+                if not full.exists():
+                    errors.append({'path': p, 'error': 'Not found'})
+                    continue
+                if full.is_dir():
+                    if not req.include_dirs:
+                        errors.append({'path': p, 'error': 'Is a directory; set include_dirs=true'})
+                        continue
+                    shutil.rmtree(str(full))
+                else:
+                    full.unlink()
+            deleted.append(p)
+        except Exception as e:
+            errors.append({'path': p, 'error': str(e)})
+    _build_and_sync(str(root))
+    return {'deleted': deleted, 'errors': errors}
+
+
+@app.post('/api/fs/{section}/reindex')
+async def fs_reindex(section: str, payload: dict = Depends(require_jwt)):
+    """Rebuild BM25 .index.json for a section after user upload completes.
+    Called automatically by BPulseFileTree._checkBatchComplete(). (REQ-11)"""
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    t0 = time.time()
+    idx = _build_and_sync(str(root))
+    elapsed = round((time.time() - t0) * 1000, 1)
+    file_count = _count_files_in_tree(idx.get('tree', []))
+    return {'indexed_files': file_count, 'elapsed_ms': elapsed, 'section': section}
+
+
+@app.patch('/api/fs/{section}/file/used')
+async def fs_mark_file_used(section: str, request: Request, path: str = '', payload: dict = Depends(require_jwt)):
+    """Mark a workflow file as recently used. Updates last_used timestamp in section metadata.
+    Also appends an audit entry to sajhamcpserver/data/audit/file_used.jsonl (BUG-FS-002)."""
+    # Accept path from query string or JSON body
+    if not path:
+        try:
+            body = await request.json()
+            path = body.get('path', '')
+        except Exception:
+            pass
+    worker = _fs_worker(payload)
+    if not path:
+        raise HTTPException(status_code=400, detail='path required')
+    # Record usage in a simple metadata sidecar
+    root = _resolve_fs_path(worker, payload['user_id'], section)
+    meta_path = root / '.used_metadata.json'
+    try:
+        if _S3_MODE:
+            meta = json.loads(_storage.read_text(str(meta_path))) if _storage.exists(str(meta_path)) else {}
+        else:
+            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    except Exception:
+        meta = {}
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    meta[path] = {'last_used': now_iso}
+    if _S3_MODE:
+        _storage.write_text(str(meta_path), json.dumps(meta, indent=2))
+    else:
+        meta_path.write_text(json.dumps(meta, indent=2))
+    # Audit log (BUG-FS-002) — Postgres primary, JSONL fallback
+    if _DB_ENABLED:
+        try:
+            await _db_repo.log_file_access(
+                user_id=payload.get('user_id', ''),
+                worker_id=worker.get('worker_id', ''),
+                file_path=path,
+                section=section,
+                detail={'used_at': now_iso},
+            )
+        except Exception:
+            pass
+    else:
+        audit_path = pathlib.Path('sajhamcpserver/data/audit/file_used.jsonl')
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(audit_path, 'a') as f:
+            f.write(json.dumps({
+                'user_id': payload.get('user_id', ''),
+                'worker_id': worker.get('worker_id', ''),
+                'section': section,
+                'path': path,
+                'used_at': now_iso,
+            }) + '\n')
+    return {'ok': True, 'path': path}
+
+
+@app.delete('/api/fs/{section}/file')
+async def fs_delete_file(section: str, path: str = '', payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    full = _resolve_fs_path(worker, uid, section, path)
+    if _S3_MODE:
+        if not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='File not found')
+        _storage.delete(str(full))
+    else:
+        if not full.exists():
+            raise HTTPException(status_code=404, detail='File not found')
+        full.unlink()
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+@app.delete('/api/fs/{section}/folder')
+async def fs_delete_folder(section: str, path: str = '', payload: dict = Depends(require_jwt)):
+    if section not in _WRITABLE_SECTIONS:
+        raise HTTPException(status_code=403, detail='Section is read-only')
+    worker = _fs_worker(payload)
+    uid = payload['user_id']
+    root = _resolve_fs_path(worker, uid, section)
+    full = _resolve_fs_path(worker, uid, section, path)
+    if _S3_MODE:
+        prefix_keys = _storage.list_prefix(str(full))
+        if not prefix_keys and not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='Folder not found')
+        if prefix_keys:
+            raise HTTPException(status_code=400, detail='Folder is not empty')
+        # Empty S3 "folder" — no objects to delete, just rebuild index
+    else:
+        if not full.exists():
+            raise HTTPException(status_code=404, detail='Folder not found')
+        try:
+            full.rmdir()
+        except OSError:
+            raise HTTPException(status_code=400, detail='Folder is not empty')
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+# ── Chart serving endpoints (REQ-03) ───────────────────────────────────────────
+
+def _resolve_charts_root(worker: dict, user_id: str) -> pathlib.Path:
+    """Resolve per-user charts directory from worker my_data_path."""
+    raw = worker.get('my_data_path', './data/uploads')
+    base = pathlib.Path('sajhamcpserver')
+    return (base / raw.lstrip('./')).resolve() / user_id / 'charts'
+
+
+@app.get('/api/fs/charts')
+async def list_charts(payload: dict = Depends(require_jwt)):
+    """List available charts (HTML and PNG) for the authenticated user."""
+    worker = _fs_worker(payload)
+    charts_root = _resolve_charts_root(worker, payload['user_id'])
+    charts = []
+    if _S3_MODE:
+        charts_prefix = str(charts_root)
+        keys = _storage.list_prefix(charts_prefix)
+        for rel in keys:
+            if rel.startswith('.'):
+                continue
+            name = rel.split('/')[-1]
+            suffix = '.' + name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+            if suffix in ('.html', '.png'):
+                key = charts_prefix.rstrip('/') + '/' + rel
+                charts.append({
+                    'filename': name,
+                    'type': 'html' if suffix == '.html' else 'png',
+                    'url': f'/api/fs/charts/{name}',
+                    'size': _storage.get_size(key),
+                    'modified': None,
+                })
+    else:
+        if not charts_root.exists():
+            return {'charts': []}
+        for f in sorted(charts_root.iterdir()):
+            if f.suffix in ('.html', '.png') and f.is_file():
+                charts.append({
+                    'filename': f.name,
+                    'type': 'html' if f.suffix == '.html' else 'png',
+                    'url': f'/api/fs/charts/{f.name}',
+                    'size': f.stat().st_size,
+                    'modified': f.stat().st_mtime,
+                })
+    return {'charts': charts}
+
+
+@app.get('/api/fs/charts/{filename}')
+async def serve_chart(filename: str, token: str = '', payload: dict = None,
+                      creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+    """Serve a chart file (HTML or PNG).
+
+    Accepts auth via Bearer header OR ?token= query param so iframes can load
+    charts without needing custom request headers.
+    """
+    # Resolve JWT from header or query param
+    raw_token = token or (creds.credentials if creds else '')
+    if not raw_token:
+        raise HTTPException(status_code=401, detail='Not authenticated')
+    try:
+        payload = _jwt_decode(raw_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail='Invalid token')
+
+    # Reject path traversal attempts
+    if '/' in filename or '\\' in filename or '..' in filename:
+        raise HTTPException(status_code=400, detail='Invalid filename')
+    worker = _fs_worker(payload)
+    charts_root = _resolve_charts_root(worker, payload['user_id'])
+    chart_path = (charts_root / filename).resolve()
+    if not str(chart_path).startswith(str(charts_root)):
+        raise HTTPException(status_code=400, detail='Path traversal not allowed')
+    if _S3_MODE:
+        if not _storage.exists(str(chart_path)):
+            raise HTTPException(status_code=404, detail='Chart not found')
+        content = _storage.read_bytes(str(chart_path))
+        media_type = 'image/png' if chart_path.suffix == '.png' else 'text/html'
+        return Response(content=content, media_type=media_type)
+    if not chart_path.exists():
+        raise HTTPException(status_code=404, detail='Chart not found')
+    if chart_path.suffix == '.png':
+        return serve_file(str(chart_path), media_type='image/png')
+    return serve_file(str(chart_path), media_type='text/html')
+
+
+# ── Admin API ──────────────────────────────────────────────────────────────────
+
+class AdminFolderRequest(BaseModel):
+    section: str
+    path: str
+
+class AdminDeleteRequest(BaseModel):
+    section: str
+    path: str
+    recursive: bool = False
+
+class AdminRenameRequest(BaseModel):
+    section: str
+    path: str
+    new_name: str
+
+class AdminMoveRequest(BaseModel):
+    section: str
+    src_path: str
+    dest_folder: str
+
+class AdminFileRequest(BaseModel):
+    section: str
+    folder: str = ''
+    filename: str
+
+_MD_STUB = '''---
+name:
+description:
+inputs:
+tags: []
+version: "1.0"
+---
+
+## Step 1
+'''
+
+
+@app.get('/api/admin/tree/{section}')
+async def admin_tree(section: str, worker_id: str = '', _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(section)
+    root.mkdir(parents=True, exist_ok=True)
+    idx = get_index(str(root))
+    return idx
+
+
+@app.post('/api/admin/upload')
+async def admin_upload(
+    section: str,
+    path: str = '',
+    overwrite: bool = False,
+    file: UploadFile = File(...),
+    _: dict = Depends(require_admin),
+):
+    root = _resolve_admin_path(section).resolve()
+    if section == 'verified_workflows' and not file.filename.endswith('.md'):
+        raise HTTPException(status_code=415, detail='Verified Workflows only accepts .md files')
+    folder = _resolve_admin_path(section, path).resolve() if path else root
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / pathlib.Path(file.filename).name
+    if dest.exists() and not overwrite:
+        raise HTTPException(status_code=409, detail='File already exists')
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail='File exceeds 20 MB limit')
+    dest.write_bytes(content)
+    _build_and_sync(str(root))
+    stat = dest.stat()
+    from datetime import datetime, timezone
+    return {
+        'path': str(dest.relative_to(root)).replace('\\', '/'),
+        'size_bytes': stat.st_size,
+        'modified_at': datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+@app.post('/api/admin/folder')
+async def admin_folder(req: AdminFolderRequest, _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(req.section)
+    full = _resolve_admin_path(req.section, req.path)
+    full.mkdir(parents=True, exist_ok=True)
+    _build_and_sync(str(root))
+    return {'created': True, 'path': req.path}
+
+
+@app.delete('/api/admin/item')
+async def admin_delete(req: AdminDeleteRequest, _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(req.section)
+    full = _resolve_admin_path(req.section, req.path)
+    if not full.exists():
+        raise HTTPException(status_code=404, detail='Not found')
+    if full.is_dir():
+        items = list(full.rglob('*'))
+        count = len([x for x in items if x.is_file()])
+        if count > 0 and not req.recursive:
+            raise HTTPException(status_code=409, detail=f'Folder contains {count} items. Use recursive=true to delete.')
+        shutil.rmtree(full)
+    else:
+        full.unlink()
+    _build_and_sync(str(root))
+    return {'ok': True}
+
+
+@app.patch('/api/admin/rename')
+async def admin_rename(req: AdminRenameRequest, _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(req.section)
+    full = _resolve_admin_path(req.section, req.path)
+    if not full.exists():
+        raise HTTPException(status_code=404, detail='Not found')
+    # Block root-level section folders from being renamed
+    if full == root:
+        raise HTTPException(status_code=400, detail='Cannot rename root section folder')
+    new_name = pathlib.Path(req.new_name).name
+    if not new_name or '/' in new_name or '\\' in new_name:
+        raise HTTPException(status_code=400, detail='Invalid name')
+    new_full = full.parent / new_name
+    if new_full.exists():
+        raise HTTPException(status_code=409, detail='A file or folder with this name already exists')
+    full.rename(new_full)
+    _build_and_sync(str(root))
+    new_path = str(new_full.relative_to(root.resolve())).replace('\\', '/')
+    return {'new_path': new_path}
+
+
+@app.post('/api/admin/move')
+async def admin_move(req: AdminMoveRequest, _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(req.section).resolve()
+    src_full = _resolve_admin_path(req.section, req.src_path).resolve()
+    dst_full = _resolve_admin_path(req.section, req.dest_folder).resolve() / src_full.name
+    if not src_full.exists():
+        raise HTTPException(status_code=404, detail='Source not found')
+    # Prevent moving into self or descendant
+    try:
+        dst_full.relative_to(src_full)
+        raise HTTPException(status_code=400, detail='Cannot move a folder into itself or its own subfolder')
+    except ValueError:
+        pass
+    if dst_full.exists():
+        raise HTTPException(status_code=409, detail=f'"{src_full.name}" already exists in target folder')
+    dst_full.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src_full), str(dst_full))
+    _build_and_sync(str(root))
+    return {'ok': True, 'new_path': str(dst_full.relative_to(root)).replace('\\', '/')}
+
+
+@app.post('/api/admin/file')
+async def admin_new_file(req: AdminFileRequest, _: dict = Depends(require_admin)):
+    root = _resolve_admin_path(req.section)
+    folder_path = req.folder if req.folder else ''
+    folder_full = _resolve_admin_path(req.section, folder_path) if folder_path else root
+    folder_full.mkdir(parents=True, exist_ok=True)
+    name = pathlib.Path(req.filename).name
+    dest = folder_full / name
+    dest.write_text(_MD_STUB, encoding='utf-8')
+    _build_and_sync(str(root))
+    rel_path = str(dest.relative_to(root)).replace('\\', '/')
+    return {'path': rel_path}
+
+
+@app.get('/api/admin/file')
+async def admin_read_file(section: str, path: str, _: dict = Depends(require_admin)):
+    """Return file content for preview. Truncated at 2MB for text files."""
+    from fastapi.responses import Response as _Resp
+    full = _resolve_admin_path(section, path).resolve()
+    if not full.exists() or not full.is_file():
+        raise HTTPException(status_code=404, detail='File not found')
+    size = full.stat().st_size
+    TRUNCATE = 2 * 1024 * 1024
+    TEXT_EXTS = {'.md', '.txt', '.csv', '.tsv', '.json', '.html', '.xml', '.yaml', '.yml'}
+    BINARY_EXTS = {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.parquet', '.pq', '.png', '.jpg'}
+    ext = full.suffix.lower()
+    headers = {'X-File-Size': str(size), 'X-File-Name': full.name,
+               'Access-Control-Expose-Headers': 'X-File-Size,X-File-Name,X-Truncated'}
+    if ext in BINARY_EXTS:
+        content = full.read_bytes()
+        media = ('application/pdf' if ext == '.pdf' else
+                 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' if ext == '.docx' else
+                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if ext == '.xlsx' else
+                 'application/octet-stream')
+        return _Resp(content=content, media_type=media, headers=headers)
+    try:
+        raw = full.read_bytes()
+        truncated = len(raw) > TRUNCATE
+        if truncated:
+            raw = raw[:TRUNCATE]
+            headers['X-Truncated'] = '1'
+        text = raw.decode('utf-8', errors='replace')
+        return _Resp(content=text, media_type='text/plain; charset=utf-8', headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/api/admin/validate/{section}/{path:path}')
+async def admin_validate(section: str, path: str, _: dict = Depends(require_admin)):
+    full = _resolve_admin_path(section, path)
+    if not full.exists() or not full.is_file():
+        raise HTTPException(status_code=404, detail='File not found')
+    content = full.read_text(encoding='utf-8', errors='replace')
+    valid = False
+    missing = []
+    if content.startswith('---'):
+        end = content.find('---', 3)
+        if end != -1:
+            fm_block = content[3:end].strip()
+            required = ['name', 'description', 'inputs']
+            found = {k: False for k in required}
+            for line in fm_block.splitlines():
+                for k in required:
+                    if line.strip().startswith(k + ':'):
+                        val = line.split(':', 1)[1].strip()
+                        if val:
+                            found[k] = True
+            missing = [k for k, v in found.items() if not v]
+            valid = len(missing) == 0
+    else:
+        missing = ['name', 'description', 'inputs']
+    return {'valid': valid, 'missing': missing}
+
+
+# ── Agent run ──────────────────────────────────────────────────────────────────
+
+class RunRequest(BaseModel):
+    query: str
+    thread_id: str = ''
+    resume: str | None = None
+    worker_id: Optional[str] = None
+
+@app.post('/api/agent/run')
+async def run_agent(req: RunRequest, payload: dict = Depends(require_jwt)):
+    """Run the agent for the calling user's worker.
+    - Builds a per-request agent with the worker's current system_prompt + enabled_tools (G-01, G-02).
+    - Sets _worker_ctx so tool calls carry X-Worker-Id / X-Worker-Data-Root headers (G-04).
+    - Validates thread ownership on resume (G-08).
+    - All roles (user, admin, super_admin) may call this endpoint.
+    """
+    user = _find_user(payload['user_id'])
+    worker = _resolve_worker_for_user(user, req.worker_id) if user else None
+    if not worker:
+        raise HTTPException(status_code=404, detail='No worker assigned to this user')
+
+    # Per-request agent: fresh system prompt + filtered tools on every call (G-01 + G-02)
+    agent_mode = worker.get('agent_mode', 'single')
+    system_prompt = get_system_prompt(worker, agent_mode)
+    tools = get_tools_for_worker(worker.get('enabled_tools', ['*']))
+
+    # REQ-14: build optional middlewares from worker config
+    from agent.middlewares import (
+        MemoryMiddleware, TokenBudgetMiddleware,
+        HumanInTheLoopMiddleware, AuditMiddleware,
+    )
+    extra_mw = []
+    if worker.get('enable_memory'):
+        extra_mw.append(MemoryMiddleware(
+            max_memories=worker.get('max_memories_per_query', 5),
+            min_similarity=worker.get('min_memory_similarity', 0.75),
+            ttl_days=worker.get('memory_ttl_days', 90),
+        ))
+    if worker.get('max_tokens_per_query'):
+        extra_mw.append(TokenBudgetMiddleware(max_tokens_per_query=worker['max_tokens_per_query']))
+    if agent_mode == 'multi':
+        from agent.middlewares import SubagentLimitMiddleware
+        extra_mw.append(SubagentLimitMiddleware(
+            max_concurrent=worker.get('max_concurrent_subagents', 3)
+        ))
+    if worker.get('hitl_triggers'):
+        extra_mw.append(HumanInTheLoopMiddleware(
+            triggers=worker['hitl_triggers'],
+            timeout_seconds=worker.get('hitl_timeout_seconds', 300),
+        ))
+    extra_mw.append(AuditMiddleware())
+
+    if agent_mode == 'multi':
+        from agent.sub_agent_tool import create_task_tool
+        import agent.agent as _ag
+        task_tool = create_task_tool(
+            parent_tools=tools,
+            parent_worker_ctx={**worker, 'user_id': payload['user_id']},
+            llm=_ag.llm,
+            create_agent_fn=create_agent_for_worker,
+        )
+        agent_instance = create_agent_for_worker(system_prompt, tools + [task_tool], extra_middleware=extra_mw)
+    else:
+        agent_instance = create_agent_for_worker(system_prompt, tools, extra_middleware=extra_mw)
+
+    thread_id = req.thread_id or str(uuid.uuid4())
+    config = {'configurable': {'thread_id': thread_id}, 'recursion_limit': 100}
+
+    # Thread ownership — validate on resume, register on new thread (G-08)
+    if req.thread_id or req.resume:
+        owner = _thread_registry.get(thread_id)
+        if owner:
+            if owner['user_id'] != payload['user_id'] or owner['worker_id'] != worker['worker_id']:
+                raise HTTPException(status_code=403, detail='Thread belongs to a different user or worker')
+    if not (req.thread_id or req.resume):
+        import datetime
+        # Derive a short title from the query (first 80 chars, trimmed)
+        _raw_title = (req.query or '').strip()
+        _thread_title = (_raw_title[:77] + '...') if len(_raw_title) > 80 else _raw_title or None
+        meta = {
+            'user_id': payload['user_id'],
+            'worker_id': worker['worker_id'],
+            'title': _thread_title,
+            'created_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        }
+        _thread_registry[thread_id] = meta
+        await _persist_thread(thread_id, meta)
+
+    async def stream():
+        # Inject worker context into ContextVar for this async task (G-04 + G-13)
+        # thread_id included so _log_audit in tools.py can correlate all tool events
+        ctx_token = _worker_ctx.set({**worker, 'user_id': payload['user_id'], 'thread_id': thread_id})
+        # REQ-13: SSE queue for sub-agent task events
+        import asyncio as _asyncio
+        _sse_queue = _asyncio.Queue()
+        _sse_token = _set_stream_writer(_sse_queue.put_nowait)
+        _run_start = time.time()
+        try:
+            yield f"data: {json.dumps({'type': 'session', 'thread_id': thread_id})}\n\n"
+            # Log user query to DB
+            if _DB_ENABLED and req.query and not req.resume:
+                try:
+                    await _db_repo.log_event(
+                        'query', payload['user_id'], worker['worker_id'],
+                        thread_id=thread_id,
+                        detail={'query': req.query[:2000]},
+                    )
+                except Exception:
+                    pass
+            inp = ({'messages': [{'role': 'user', 'content': req.query}]}
+                   if not req.resume else {'resume': req.resume})
+            full_text = []
+            _canvas_streaming = False
+            _canvas_buf = ''
+            _canvas_title = 'Report'
+            _text_pending = ''
+            from agent.middlewares.token_budget import BudgetExceededError
+            async for event in agent_instance.astream_events(inp, config=config, version='v2'):
+                # Drain sub-agent SSE events accumulated during this iteration
+                while not _sse_queue.empty():
+                    sa_evt = _sse_queue.get_nowait()
+                    yield f"data: {json.dumps(sa_evt)}\n\n"
+                    # DB audit for sub-agent lifecycle events
+                    if _DB_ENABLED:
+                        _sa_type = sa_evt.get('type', '')
+                        if _sa_type in ('task_started', 'task_completed', 'task_failed', 'task_timed_out'):
+                            try:
+                                await _db_repo.log_event(
+                                    'subagent', payload['user_id'], worker['worker_id'],
+                                    thread_id=thread_id,
+                                    detail={k: v for k, v in sa_evt.items() if k != 'type'},
+                                    tool_name=_sa_type,
+                                )
+                            except Exception:
+                                pass
+                t = event['event']
+                if t == 'on_chat_model_stream':
+                    chunk = event['data']['chunk']
+                    if hasattr(chunk, 'content'):
+                        content = chunk.content
+                        raw_chunks = []
+                        if isinstance(content, str) and content:
+                            raw_chunks = [content]
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get('type') == 'text' and block.get('text'):
+                                    raw_chunks.append(block['text'])
+                                elif hasattr(block, 'text') and block.text:
+                                    raw_chunks.append(block.text)
+                        for _rc in raw_chunks:
+                            full_text.append(_rc)
+                            if _canvas_streaming:
+                                _canvas_buf += _rc
+                                yield f"data: {json.dumps({'type': 'canvas_stream_chunk', 'text': _rc})}\n\n"
+                            else:
+                                _text_pending += _rc
+                                marker = _text_pending.find('[CANVAS]')
+                                if marker >= 0:
+                                    # Flush text before marker to chat
+                                    before = _text_pending[:marker]
+                                    if before:
+                                        yield f"data: {json.dumps({'type': 'text', 'text': before})}\n\n"
+                                    rest = _text_pending[marker + 8:]
+                                    nl = rest.find('\n')
+                                    if nl >= 0:
+                                        _canvas_title = rest[:nl].strip() or 'Report'
+                                        after_title = rest[nl + 1:]
+                                        _canvas_streaming = True
+                                        yield f"data: {json.dumps({'type': 'canvas_stream_start', 'title': _canvas_title})}\n\n"
+                                        if after_title:
+                                            _canvas_buf = after_title
+                                            yield f"data: {json.dumps({'type': 'canvas_stream_chunk', 'text': after_title})}\n\n"
+                                        else:
+                                            _canvas_buf = ''
+                                        _text_pending = ''
+                                    else:
+                                        # Title not yet complete — keep buffered
+                                        _text_pending = '[CANVAS]' + rest
+                                else:
+                                    # Flush all but last 8 chars (marker boundary guard)
+                                    safe_end = max(0, len(_text_pending) - 8)
+                                    if safe_end > 0:
+                                        safe = _text_pending[:safe_end]
+                                        yield f"data: {json.dumps({'type': 'text', 'text': safe})}\n\n"
+                                        _text_pending = _text_pending[safe_end:]
+                elif t == 'on_tool_start':
+                    yield f"data: {json.dumps({'type': 'tool_start', 'name': event['name'], 'input': event['data'].get('input', {}), 'run_id': event['run_id']})}\n\n"
+                elif t == 'on_tool_end':
+                    output = event['data'].get('output', '')
+                    if hasattr(output, 'content'):
+                        output = output.content
+                    if not isinstance(output, (str, dict, list)):
+                        output = str(output)
+                    # LangGraph may serialize ToolMessage content as a JSON string — parse it back
+                    if isinstance(output, str):
+                        try:
+                            _parsed = json.loads(output)
+                            if isinstance(_parsed, dict):
+                                output = _parsed
+                        except (ValueError, TypeError):
+                            pass
+                    yield f"data: {json.dumps({'type': 'tool_end', 'name': event['name'], 'output': output, 'run_id': event['run_id']})}\n\n"
+                    if isinstance(output, dict) and output.get('_chart_ready'):
+                        # Unified chart-ready SSE: covers generate_chart (html_file) and python_execute (figures)
+                        if output.get('html_file'):
+                            chart_title = output.get('title', 'Chart')
+                            chart_url = '/api/fs/charts/' + output['html_file']
+                            yield f"data: {json.dumps({'type': 'canvas', 'title': chart_title, 'content': '', 'canvas_type': 'chart', 'chart_url': chart_url})}\n\n"
+                            if _DB_ENABLED:
+                                try:
+                                    await _db_repo.log_event(
+                                        'canvas', payload['user_id'], worker['worker_id'],
+                                        thread_id=thread_id,
+                                        detail={'canvas_type': 'chart', 'title': chart_title, 'chart_url': chart_url},
+                                    )
+                                except Exception:
+                                    pass
+                        elif output.get('figures'):
+                            first_fig = output['figures'][0]
+                            chart_title = output.get('title', 'Python Chart')
+                            yield f"data: {json.dumps({'type': 'canvas', 'title': chart_title, 'canvas_type': 'chart', 'chart_url': first_fig['url']})}\n\n"
+                            if _DB_ENABLED:
+                                try:
+                                    await _db_repo.log_event(
+                                        'canvas', payload['user_id'], worker['worker_id'],
+                                        thread_id=thread_id,
+                                        detail={'canvas_type': 'chart', 'title': chart_title,
+                                                'chart_url': first_fig['url']},
+                                    )
+                                except Exception:
+                                    pass
+                elif t == 'on_interrupt':
+                    yield f"data: {json.dumps({'type': 'hitl', 'question': event['data'].get('question', ''), 'options': event['data'].get('options', []), 'thread_id': thread_id})}\n\n"
+                elif t == 'on_chat_model_end':
+                    output = event['data'].get('output')
+                    # Fallback for non-streaming providers (e.g. HuggingFace): if
+                    # on_chat_model_stream produced no chunks, extract text from the
+                    # completed output object and emit it now so the UI is not blank.
+                    if output and not getattr(output, 'tool_calls', None):
+                        content = getattr(output, 'content', '')
+                        if isinstance(content, str) and content and not full_text:
+                            full_text.append(content)
+                            yield f"data: {json.dumps({'type': 'text', 'text': content})}\n\n"
+                        elif isinstance(content, list) and not full_text:
+                            for _block in content:
+                                _txt = (_block.get('text') if isinstance(_block, dict)
+                                        else getattr(_block, 'text', ''))
+                                if _txt:
+                                    full_text.append(_txt)
+                                    yield f"data: {json.dumps({'type': 'text', 'text': _txt})}\n\n"
+                    usage = {}
+                    if output and hasattr(output, 'usage_metadata'):
+                        um = output.usage_metadata
+                        if um:
+                            usage = um if isinstance(um, dict) else dict(um)
+                    if usage:
+                        yield f"data: {json.dumps({'type': 'usage', 'usage': usage})}\n\n"
+                        if _DB_ENABLED:
+                            try:
+                                await _db_repo.log_event(
+                                    'usage', payload['user_id'], worker['worker_id'],
+                                    thread_id=thread_id,
+                                    detail={
+                                        'input_tokens': usage.get('input_tokens', 0),
+                                        'output_tokens': usage.get('output_tokens', 0),
+                                        'total_tokens': usage.get('total_tokens',
+                                            usage.get('input_tokens', 0) + usage.get('output_tokens', 0)),
+                                    },
+                                )
+                            except Exception:
+                                pass
+            import json as _json, re as _re
+            # Flush any remaining look-ahead buffer
+            if _text_pending and not _canvas_streaming:
+                yield f"data: {json.dumps({'type': 'text', 'text': _text_pending})}\n\n"
+            # Emit canvas_stream_end if we were streaming to canvas
+            if _canvas_streaming:
+                yield f"data: {_json.dumps({'type': 'canvas_stream_end', 'title': _canvas_title, 'content': _canvas_buf})}\n\n"
+
+            assembled = ''.join(full_text).strip()
+
+            def _try_parse_envelope(s):
+                try:
+                    obj = _json.loads(s)
+                    if 'summary' in obj and 'canvas' in obj:
+                        return obj
+                except Exception:
+                    pass
+                return None
+
+            envelope = None
+            # 1. JSON inside ```json ... ``` fence
+            _fence_match = _re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', assembled)
+            if _fence_match:
+                envelope = _try_parse_envelope(_fence_match.group(1).strip())
+            # 2. Whole response is a bare JSON object
+            if not envelope and assembled.startswith('{'):
+                envelope = _try_parse_envelope(assembled)
+            # 3. JSON embedded anywhere in the text — scan every '{' position
+            if not envelope:
+                pos = 0
+                while pos < len(assembled):
+                    idx = assembled.find('{', pos)
+                    if idx == -1:
+                        break
+                    tail = assembled[idx:]
+                    if '"summary"' in tail and '"canvas"' in tail:
+                        # Brace-match to extract exactly the JSON object (no trailing text)
+                        _depth = 0
+                        _end = -1
+                        for _ci, _ch in enumerate(tail):
+                            if _ch == '{':
+                                _depth += 1
+                            elif _ch == '}':
+                                _depth -= 1
+                                if _depth == 0:
+                                    _end = _ci
+                                    break
+                        if _end >= 0:
+                            envelope = _try_parse_envelope(tail[:_end + 1])
+                            if envelope:
+                                break
+                    pos = idx + 1
+
+            # 4. [CANVAS] marker pattern: text before marker goes to chat, rest to canvas
+            if not envelope:
+                _marker = assembled.find('[CANVAS]')
+                if _marker != -1:
+                    _end_marker = assembled.find('[/CANVAS]', _marker)
+                    _canvas_content = assembled[_marker+8: _end_marker if _end_marker != -1 else None].strip()
+                    _summary = assembled[:_marker].strip()
+                    # Extract title from first # heading in canvas content, or use default
+                    _title_match = _re.match(r'^#{1,3}\s*(.+)', _canvas_content)
+                    _canvas_title = _title_match.group(1).strip() if _title_match else 'Document'
+                    envelope = {
+                        'summary': _summary,
+                        'canvas': {'title': _canvas_title, 'content': _canvas_content, 'type': 'report'}
+                    }
+
+            if envelope and not _canvas_streaming:
+                canvas = envelope['canvas']
+                yield f"data: {_json.dumps({'type': 'replace_text', 'text': envelope.get('summary', '')})}\n\n"
+                yield f"data: {_json.dumps({'type': 'canvas', 'title': canvas.get('title','Document'), 'content': canvas.get('content',''), 'canvas_type': canvas.get('type','report')})}\n\n"
+                if _DB_ENABLED:
+                    try:
+                        await _db_repo.log_event(
+                            'canvas', payload['user_id'], worker['worker_id'],
+                            thread_id=thread_id,
+                            detail={'canvas_type': canvas.get('type', 'report'),
+                                    'title': canvas.get('title', 'Document'),
+                                    'summary': envelope.get('summary', '')[:500]},
+                        )
+                    except Exception:
+                        pass
+
+            # Log assembled response text to DB
+            if _DB_ENABLED and assembled:
+                try:
+                    _response_text = assembled[:5000]
+                    await _db_repo.log_event(
+                        'response', payload['user_id'], worker['worker_id'],
+                        thread_id=thread_id,
+                        detail={'text': _response_text, 'truncated': len(assembled) > 5000},
+                    )
+                except Exception:
+                    pass
+            # REQ-05: emit context gauge + summary notice if compression fired
+            try:
+                final_state = await agent_instance.aget_state(config)
+                if final_state and final_state.values:
+                    sv = final_state.values
+                    msgs = sv.get('messages', [])
+                    token_count = count_tokens_accurate(msgs)
+                    yield f"data: {_json.dumps({'type': 'context_gauge', 'tokens': token_count, 'limit': int(os.getenv('CONTEXT_MAX_TOKENS', '200000'))})}\n\n"
+                    summary_evt = _pending_summary_events.pop(thread_id, None)
+                    if summary_evt:
+                        yield f"data: {_json.dumps({'type': 'summary_occurred', 'exchanges_compressed': summary_evt.get('exchanges_compressed', 0), 'tokens_before': summary_evt.get('tokens_before', 0), 'tokens_after': summary_evt.get('tokens_after', token_count)})}\n\n"
+            except Exception:
+                pass
+            yield 'data: [DONE]\n\n'
+        except BudgetExceededError as be:
+            yield f"data: {json.dumps({'type': 'budget_exceeded', 'used': be.used, 'budget': be.budget})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Token budget exceeded ({be.used}/{be.budget} tokens). Response may be incomplete.'})}\n\n"
+            yield 'data: [DONE]\n\n'
+            if _DB_ENABLED:
+                try:
+                    await _db_repo.log_event(
+                        'error', payload['user_id'], worker['worker_id'],
+                        thread_id=thread_id,
+                        detail={'error_type': 'budget_exceeded', 'used': be.used, 'budget': be.budget},
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield 'data: [DONE]\n\n'
+            if _DB_ENABLED:
+                try:
+                    await _db_repo.log_event(
+                        'error', payload['user_id'], worker['worker_id'],
+                        thread_id=thread_id,
+                        detail={'error_type': type(e).__name__, 'message': str(e)[:1000]},
+                    )
+                except Exception:
+                    pass
+        finally:
+            from agent.sub_agent_tool import _sse_writer_ctx
+            _sse_writer_ctx.reset(_sse_token)
+            _worker_ctx.reset(ctx_token)
+            # REQ-07: update thread last_activity_at + message_count
+            if _DB_ENABLED:
+                try:
+                    await _db_repo.touch_thread(thread_id)
+                except Exception:
+                    pass
+
+    return StreamingResponse(stream(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+# ── HITL response endpoint (REQ-14) ───────────────────────────────────────────
+
+class HitlResponseRequest(BaseModel):
+    hitl_id: str
+    approved: bool
+
+@app.post('/api/chat/hitl-response')
+async def hitl_response(req: HitlResponseRequest, payload: dict = Depends(require_jwt)):
+    """Receive user approval/rejection for a Human-in-the-Loop tool gate."""
+    from agent.middlewares.hitl import HumanInTheLoopMiddleware
+    ok = HumanInTheLoopMiddleware.respond(req.hitl_id, req.approved)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f'HITL request {req.hitl_id} not found or already resolved')
+    return {'ok': True, 'hitl_id': req.hitl_id, 'approved': req.approved}
+
+
+# ── Super Admin — Worker-scoped file browser ──────────────────────────────────
+
+@app.get('/api/super/workers/{worker_id}/files/{section}')
+@app.get('/api/super/workers/{worker_id}/files/{section}/tree')
+async def super_worker_tree(worker_id: str, section: str, _: dict = Depends(require_super_admin)):
+    """Browse any worker's file tree (super_admin only). Uses admin resolver (REQ-WF-03)."""
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_admin_path_for_worker(w, section)
+    return get_index(str(root))
+
+
+@app.post('/api/super/workers/{worker_id}/files/{section}/upload')
+async def super_worker_upload(
+    worker_id: str,
+    section: str,
+    path: str = '',
+    overwrite: bool = False,
+    batch_id: str = '',
+    file: UploadFile = File(...),
+    _: dict = Depends(require_super_admin),
+):
+    """Upload a file into any worker's scoped section (super_admin only). Uses admin resolver (REQ-WF-03)."""
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_admin_path_for_worker(w, section)
+    folder = _resolve_admin_path_for_worker(w, section, path) if path else root
+    if not _S3_MODE:
+        folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / pathlib.Path(file.filename).name
+    _dest_exists = _storage.exists(str(dest)) if _S3_MODE else dest.exists()
+    if _dest_exists and not overwrite:
+        raise HTTPException(status_code=409, detail='File already exists')
+    size_bytes = await _stream_upload(file, dest)
+    if not batch_id:
+        _build_and_sync(str(root))
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not _S3_MODE:
+        stat = dest.stat()
+        size_bytes = stat.st_size
+        now_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    return {
+        'path': str(dest.relative_to(root)).replace('\\', '/'),
+        'size_bytes': size_bytes,
+        'modified_at': now_iso,
+    }
+
+
+def _count_files_in_tree(tree: list) -> int:
+    """Recursively count file entries in an .index.json tree. (REQ-11)"""
+    count = 0
+    for item in tree:
+        if item.get('type') == 'file':
+            count += 1
+        elif item.get('type') == 'folder':
+            count += _count_files_in_tree(item.get('children', []))
+    return count
+
+
+@app.post('/api/super/workers/{worker_id}/files/{section}/reindex')
+async def super_worker_reindex(
+    worker_id: str,
+    section: str,
+    _: dict = Depends(require_super_admin),
+):
+    """Rebuild .index.json for a section. Called once after batch upload completes. (REQ-11)"""
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_admin_path_for_worker(w, section)
+    t0 = time.time()
+    idx = _build_and_sync(str(root))
+    elapsed = round((time.time() - t0) * 1000, 1)
+    file_count = _count_files_in_tree(idx.get('tree', []))
+    return {'indexed_files': file_count, 'elapsed_ms': elapsed, 'section': section}
+
+
+# ── Admin — Own worker file browser ───────────────────────────────────────────
+
+@app.get('/api/admin/worker/files/{section}')
+@app.get('/api/admin/worker/files/{section}/tree')
+async def admin_worker_tree(section: str, payload: dict = Depends(require_admin)):
+    """Browse the admin's own worker file tree."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_worker_path(w, section)
+    return get_index(str(root))
+
+
+@app.post('/api/admin/worker/files/{section}/upload')
+async def admin_worker_upload(
+    section: str,
+    path: str = '',
+    overwrite: bool = False,
+    batch_id: str = '',
+    file: UploadFile = File(...),
+    payload: dict = Depends(require_admin),
+):
+    """Upload a file into the admin's own worker section."""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_worker_path(w, section)
+    folder = _resolve_worker_path(w, section, path) if path else root
+    if not _S3_MODE:
+        folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / pathlib.Path(file.filename).name
+    _dest_exists = _storage.exists(str(dest)) if _S3_MODE else dest.exists()
+    if _dest_exists and not overwrite:
+        raise HTTPException(status_code=409, detail='File already exists')
+    size_bytes = await _stream_upload(file, dest)
+    if not batch_id:
+        _build_and_sync(str(root))
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not _S3_MODE:
+        stat = dest.stat()
+        size_bytes = stat.st_size
+        now_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    return {
+        'path': str(dest.relative_to(root)).replace('\\', '/'),
+        'size_bytes': size_bytes,
+        'modified_at': now_iso,
+    }
+
+
+@app.post('/api/admin/worker/files/{section}/reindex')
+async def admin_worker_reindex(section: str, payload: dict = Depends(require_admin)):
+    """Rebuild .index.json for a section. Called once after batch upload completes. (REQ-11)"""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    root = _resolve_worker_path(w, section)
+    t0 = time.time()
+    idx = _build_and_sync(str(root))
+    elapsed = round((time.time() - t0) * 1000, 1)
+    file_count = _count_files_in_tree(idx.get('tree', []))
+    return {'indexed_files': file_count, 'elapsed_ms': elapsed, 'section': section}
+
+
+@app.post('/api/admin/common/upload')
+async def admin_common_upload(
+    path: str = '',
+    overwrite: bool = False,
+    batch_id: str = '',
+    file: UploadFile = File(...),
+    payload: dict = Depends(require_admin),
+):
+    """Upload a file to common shared data (admin + super_admin). (REQ-10)"""
+    w = _get_admin_worker(payload)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    common_root = _resolve_worker_path(w, 'common')
+    folder = _resolve_worker_path(w, 'common', path) if path else common_root
+    if not _S3_MODE:
+        folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / pathlib.Path(file.filename).name
+    _dest_exists = _storage.exists(str(dest)) if _S3_MODE else dest.exists()
+    if _dest_exists and not overwrite:
+        raise HTTPException(status_code=409, detail='File already exists')
+    size_bytes = await _stream_upload(file, dest)
+    if not batch_id:
+        _build_and_sync(str(common_root))
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not _S3_MODE:
+        stat = dest.stat()
+        size_bytes = stat.st_size
+        now_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    return {
+        'path': str(dest.relative_to(common_root)).replace('\\', '/'),
+        'size_bytes': size_bytes,
+        'modified_at': now_iso,
+    }
+
+
+# ── Shared helpers for worker-scoped file CRUD ────────────────────────────────
+
+def _wf_read(w, section, path, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    if _S3_MODE:
+        if not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='File not found')
+        content_bytes = _storage.read_bytes(str(full))
+        size = len(content_bytes)
+    else:
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail='File not found')
+        content_bytes = full.read_bytes()
+        size = full.stat().st_size
+    try:
+        return {'path': path, 'encoding': 'utf-8', 'content': content_bytes.decode('utf-8'), 'size_bytes': size}
+    except UnicodeDecodeError:
+        return {'path': path, 'encoding': 'base64', 'content': base64.b64encode(content_bytes).decode('ascii'), 'size_bytes': size}
+
+def _wf_write(w, section, path, content, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    if _S3_MODE:
+        _storage.write_text(str(full), content)
+    else:
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content, encoding='utf-8')
+    _build_and_sync(str(_r(w, section)))
+    return {'ok': True}
+
+def _wf_delete_file(w, section, path, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    if _S3_MODE:
+        if not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='File not found')
+        _storage.delete(str(full))
+    else:
+        if not full.exists():
+            raise HTTPException(status_code=404, detail='File not found')
+        full.unlink()
+    _build_and_sync(str(_r(w, section)))
+    return {'ok': True}
+
+def _wf_delete_folder(w, section, path, recursive: bool = False, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    if _S3_MODE:
+        prefix_keys = _storage.list_prefix(str(full))
+        if not prefix_keys and not _storage.exists(str(full)):
+            raise HTTPException(status_code=404, detail='Folder not found')
+        if prefix_keys and not recursive:
+            raise HTTPException(status_code=409, detail=f'Folder contains {len(prefix_keys)} items. Use recursive=true to delete.')
+        for rel in prefix_keys:
+            _storage.delete(str(full).rstrip('/') + '/' + rel)
+    else:
+        if not full.exists():
+            raise HTTPException(status_code=404, detail='Folder not found')
+        items = list(full.rglob('*'))
+        count = len([x for x in items if x.is_file()])
+        if count > 0 and not recursive:
+            raise HTTPException(status_code=409, detail=f'Folder contains {count} items. Use recursive=true to delete.')
+        shutil.rmtree(full)
+    _build_and_sync(str(_r(w, section)))
+    return {'ok': True}
+
+def _wf_mkdir(w, section, path, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    if not _S3_MODE:
+        full.mkdir(parents=True, exist_ok=True)
+    # In S3 mode, "folders" are virtual — no action needed
+    _build_and_sync(str(_r(w, section)))
+    return {'ok': True}
+
+def _wf_rename(w, section, path, new_name, _res=None):
+    _r = _res or _resolve_worker_path
+    full = _r(w, section, path)
+    _full_exists = _storage.exists(str(full)) if _S3_MODE else full.exists()
+    if not _full_exists:
+        raise HTTPException(status_code=404, detail='Not found')
+    n = pathlib.Path(new_name).name
+    if not n or '/' in n or '\\' in n:
+        raise HTTPException(status_code=400, detail='Invalid name')
+    new_full = full.parent / n
+    _new_exists = _storage.exists(str(new_full)) if _S3_MODE else new_full.exists()
+    if _new_exists:
+        raise HTTPException(status_code=409, detail='A file or folder with this name already exists')
+    if _S3_MODE:
+        _storage.copy(str(full), str(new_full))
+        _storage.delete(str(full))
+    else:
+        full.rename(new_full)
+    root = _r(w, section)
+    _build_and_sync(str(root))
+    return {'new_path': str(new_full.relative_to(root)).replace('\\', '/')}
+
+def _wf_move(w, section, src, dest_folder, _res=None):
+    _r = _res or _resolve_worker_path
+    root = _r(w, section)
+    src_full = _r(w, section, src)
+    dst_full = _r(w, section, dest_folder) / src_full.name
+    _src_exists = _storage.exists(str(src_full)) if _S3_MODE else src_full.exists()
+    if not _src_exists:
+        raise HTTPException(status_code=404, detail='Source not found')
+    try:
+        dst_full.relative_to(src_full)
+        raise HTTPException(status_code=400, detail='Cannot move a folder into itself')
+    except ValueError:
+        pass
+    _dst_exists = _storage.exists(str(dst_full)) if _S3_MODE else dst_full.exists()
+    if _dst_exists:
+        raise HTTPException(status_code=409, detail=f'"{src_full.name}" already exists in target folder')
+    if _S3_MODE:
+        _storage.copy(str(src_full), str(dst_full))
+        _storage.delete(str(src_full))
+    else:
+        dst_full.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_full), str(dst_full))
+    _build_and_sync(str(root))
+    return {'ok': True, 'new_path': str(dst_full.relative_to(root)).replace('\\', '/')}
+
+
+# ── Super Admin — Worker-scoped file CRUD ─────────────────────────────────────
+
+class _WfUpdate(BaseModel):
+    path: str
+    content: str
+
+class _WfMkdir(BaseModel):
+    path: str
+
+class _WfRename(BaseModel):
+    path: str
+    new_name: str
+
+class _WfMove(BaseModel):
+    src: str
+    dest_folder: str
+
+class _WfDelete(BaseModel):
+    path: str
+    recursive: bool = False
+
+
+@app.get('/api/super/workers/{worker_id}/files/{section}/file')
+async def super_worker_read_file(worker_id: str, section: str, path: str = '', _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    if not path: raise HTTPException(status_code=400, detail='path required')
+    return _wf_read(w, section, path, _res=_resolve_admin_path_for_worker)
+
+@app.patch('/api/super/workers/{worker_id}/files/{section}/file')
+async def super_worker_write_file(worker_id: str, section: str, req: _WfUpdate, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_write(w, section, req.path, req.content, _res=_resolve_admin_path_for_worker)
+
+@app.delete('/api/super/workers/{worker_id}/files/{section}/file')
+async def super_worker_delete_file(worker_id: str, section: str, path: str = '', _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    if not path: raise HTTPException(status_code=400, detail='path required')
+    return _wf_delete_file(w, section, path, _res=_resolve_admin_path_for_worker)
+
+@app.delete('/api/super/workers/{worker_id}/files/{section}/folder')
+async def super_worker_delete_folder(worker_id: str, section: str, req: _WfDelete, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_delete_folder(w, section, req.path, req.recursive, _res=_resolve_admin_path_for_worker)
+
+@app.post('/api/super/workers/{worker_id}/files/{section}/folder')
+async def super_worker_mkdir(worker_id: str, section: str, req: _WfMkdir, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_mkdir(w, section, req.path, _res=_resolve_admin_path_for_worker)
+
+@app.post('/api/super/workers/{worker_id}/files/{section}/rename')
+async def super_worker_rename(worker_id: str, section: str, req: _WfRename, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_rename(w, section, req.path, req.new_name, _res=_resolve_admin_path_for_worker)
+
+@app.post('/api/super/workers/{worker_id}/files/{section}/move')
+async def super_worker_move(worker_id: str, section: str, req: _WfMove, _: dict = Depends(require_super_admin)):
+    w = _find_worker(worker_id)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_move(w, section, req.src, req.dest_folder, _res=_resolve_admin_path_for_worker)
+
+
+# ── Admin — Own worker file CRUD ──────────────────────────────────────────────
+
+@app.get('/api/admin/worker/files/{section}/file')
+async def admin_worker_read_file(section: str, path: str = '', payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    if not path: raise HTTPException(status_code=400, detail='path required')
+    return _wf_read(w, section, path)
+
+@app.patch('/api/admin/worker/files/{section}/file')
+async def admin_worker_write_file(section: str, req: _WfUpdate, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_write(w, section, req.path, req.content)
+
+@app.delete('/api/admin/worker/files/{section}/file')
+async def admin_worker_delete_file(section: str, path: str = '', payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    if not path: raise HTTPException(status_code=400, detail='path required')
+    if section == 'common' and payload.get('role') != 'super_admin':
+        raise HTTPException(status_code=403, detail='Only super_admin can delete from common data')
+    return _wf_delete_file(w, section, path)
+
+@app.delete('/api/admin/worker/files/{section}/folder')
+async def admin_worker_delete_folder(section: str, req: _WfDelete, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    if section == 'common' and payload.get('role') != 'super_admin':
+        raise HTTPException(status_code=403, detail='Only super_admin can delete from common data')
+    return _wf_delete_folder(w, section, req.path, req.recursive)
+
+@app.post('/api/admin/worker/files/{section}/folder')
+async def admin_worker_mkdir(section: str, req: _WfMkdir, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_mkdir(w, section, req.path)
+
+@app.post('/api/admin/worker/files/{section}/rename')
+async def admin_worker_rename(section: str, req: _WfRename, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_rename(w, section, req.path, req.new_name)
+
+@app.post('/api/admin/worker/files/{section}/move')
+async def admin_worker_move(section: str, req: _WfMove, payload: dict = Depends(require_admin)):
+    w = _get_admin_worker(payload)
+    if not w: raise HTTPException(status_code=404, detail='Worker not found')
+    return _wf_move(w, section, req.src, req.dest_folder)
+
+
+# ── Worker tool list ───────────────────────────────────────────────────────────
+
+@app.get('/api/workers/{worker_id}/tools')
+async def worker_tools_list(worker_id: str, payload: dict = Depends(require_jwt)):
+    """Return tool list for a worker, filtered to its enabled_tools allowlist."""
+    role = payload.get('role', 'user')
+    # Users can only query their own worker; admins/super_admins can query any
+    if role == 'user' and payload.get('worker_id') != worker_id:
+        raise HTTPException(status_code=403, detail='Access denied')
+    w = _find_worker(worker_id)
+    if not w:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    enabled = w.get('enabled_tools', ['*'])
+    tools_dir = pathlib.Path('sajhamcpserver/config/tools')
+    tools = []
+    for f in sorted(tools_dir.glob('*.json')):
+        try:
+            cfg = json.loads(f.read_text())
+        except Exception:
+            continue
+        name = cfg.get('name') or f.stem
+        if enabled != ['*'] and name not in enabled:
+            continue
+        meta = cfg.get('metadata', {})
+        tools.append({
+            'name': name,
+            'description': cfg.get('description', ''),
+            'category': meta.get('category', _infer_category(name)),
+            'enabled': cfg.get('enabled', True),
+            'tags': meta.get('tags', []),
+            'input_schema': cfg.get('input_schema', {}),
+        })
+    return {'worker_id': worker_id, 'tools': tools, 'enabled_tools': enabled}
+
+
+# ── Thread listing (G-08) ──────────────────────────────────────────────────────
+
+@app.get('/api/agent/threads')
+async def list_threads(payload: dict = Depends(require_jwt)):
+    """List thread IDs owned by the calling user + worker. REQ-07: reads from PostgreSQL when enabled."""
+    user_id = payload['user_id']
+    worker_id = payload.get('worker_id')
+    if _DB_ENABLED:
+        try:
+            threads = await _db_repo.list_threads(user_id, worker_id)
+            return {'threads': threads}
+        except Exception:
+            pass
+    # Fallback to in-memory registry (JSONL file).
+    # Inject message_count=1 so the frontend filter (message_count > 0) shows these threads.
+    # Threads in the registry exist because at least one agent run completed for them.
+    threads = [
+        {'thread_id': tid, 'message_count': 1, **meta}
+        for tid, meta in _thread_registry.items()
+        if meta['user_id'] == user_id and meta.get('worker_id') == worker_id
+    ]
+    return {'threads': threads}
+
+
+@app.get('/api/agent/threads/{thread_id}/messages')
+async def get_thread_messages(thread_id: str, payload: dict = Depends(require_jwt)):
+    """Return the message history for a thread from LangGraph checkpoint.
+    Used by the frontend to restore chat UI after logout/login."""
+    user_id = payload['user_id']
+    worker_id = payload.get('worker_id')
+
+    # Verify ownership: thread must belong to this user+worker
+    if _DB_ENABLED:
+        try:
+            t = await _db_repo.get_thread(thread_id)
+            if not t or t['user_id'] != user_id:
+                raise HTTPException(status_code=403, detail='Thread not accessible')
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # Load checkpoint from LangGraph using the shared checkpointer
+    try:
+        cp = _agent_module.checkpointer
+        if cp is None:
+            return {'messages': [], 'error': 'Checkpointer not initialised'}
+        config = {'configurable': {'thread_id': thread_id}}
+        state = await cp.aget(config)
+        if not state or not state.get('channel_values'):
+            return {'messages': []}
+        msgs = state['channel_values'].get('messages', [])
+        out = []
+        for m in msgs:
+            role = getattr(m, 'type', None) or getattr(m, 'role', None)
+            # LangGraph message types: HumanMessage→'human', AIMessage→'ai'
+            if role in ('human', 'ai'):
+                content = m.content if isinstance(m.content, str) else ''
+                if isinstance(m.content, list):
+                    content = ' '.join(
+                        block.get('text', '') if isinstance(block, dict) else str(block)
+                        for block in m.content
+                    ).strip()
+                if content.strip():
+                    out.append({'role': role, 'content': content})
+        return {'messages': out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {'messages': [], 'error': str(e)}
+
+
+# ── Audit log (G-13) ───────────────────────────────────────────────────────────
+
+@app.get('/api/super/audit')
+async def super_audit_log(
+    worker_id: str = '',
+    user_id: str = '',
+    limit: int = 100,
+    offset: int = 0,
+    _: dict = Depends(require_super_admin),
+):
+    """Return recent audit log entries. REQ-07: reads from PostgreSQL when enabled."""
+    def _normalise(entry: dict) -> dict:
+        """Normalise DB field names to match the JSONL schema the UI expects."""
+        return {
+            'timestamp':   entry.get('created_at') or entry.get('timestamp'),
+            'worker_id':   entry.get('worker_id'),
+            'user_id':     entry.get('user_id'),
+            'tool_name':   entry.get('tool_name'),
+            'status':      ('success' if entry.get('tool_result_ok') else 'error')
+                           if entry.get('tool_result_ok') is not None
+                           else entry.get('status', '—'),
+            'duration_ms': entry.get('elapsed_ms') if entry.get('elapsed_ms') is not None
+                           else entry.get('duration_ms'),
+        }
+    if _DB_ENABLED:
+        try:
+            entries = await _db_repo.query_audit(
+                worker_id=worker_id or None,
+                user_id=user_id or None,
+                limit=limit,
+                offset=offset,
+            )
+            return {'entries': [_normalise(e) for e in entries], 'total_returned': len(entries), 'offset': offset, 'limit': limit}
+        except Exception:
+            pass
+    # Fallback: JSONL file
+    if not _AUDIT_LOG.exists():
+        return {'entries': [], 'total_matched': 0, 'offset': offset, 'limit': limit}
+    lines = _AUDIT_LOG.read_text().splitlines()
+    matched = []
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if worker_id and entry.get('worker_id') != worker_id:
+            continue
+        if user_id and entry.get('user_id') != user_id:
+            continue
+        matched.append(entry)
+    total_matched = len(matched)
+    page = matched[offset: offset + limit]
+    return {'entries': page, 'total_matched': total_matched, 'total_returned': len(page), 'offset': offset, 'limit': limit}
+
+
+# ── Connectors API ────────────────────────────────────────────────────────────
+
+_CONNECTORS_FILE = pathlib.Path('sajhamcpserver/config/connectors.json')
+
+_CONNECTOR_DEFAULTS = [
+    {
+        'connector_type': 'microsoft_azure',
+        'display_name': 'Microsoft 365',
+        'status': 'not_configured',
+        'enabled': False,
+        'has_credentials': False,
+        'tool_count': 24,
+    },
+    {
+        'connector_type': 'atlassian',
+        'display_name': 'Atlassian',
+        'status': 'not_configured',
+        'enabled': False,
+        'has_credentials': False,
+        'tool_count': 12,
+    },
+]
+
+
+def _load_connectors() -> list:
+    """Load connectors — Postgres primary, JSON file fallback."""
+    saved: dict = {}
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    rows = pool.submit(asyncio.run, _db_repo.list_connectors()).result(timeout=5)
+            else:
+                rows = loop.run_until_complete(_db_repo.list_connectors())
+            saved = {r['connector_type']: r for r in rows}
+        except Exception:
+            pass
+    if not saved:
+        try:
+            data = json.loads(_CONNECTORS_FILE.read_text())
+            saved = {c['connector_type']: c for c in data.get('connectors', [])}
+        except Exception:
+            saved = {}
+    result = []
+    for d in _CONNECTOR_DEFAULTS:
+        ct = d['connector_type']
+        if ct in saved:
+            safe = {k: v for k, v in saved[ct].items() if k != 'credentials'}
+            safe['has_credentials'] = bool(saved[ct].get('credentials') or saved[ct].get('has_credentials'))
+            safe.setdefault('tool_count', d['tool_count'])
+            result.append(safe)
+        else:
+            result.append(dict(d))
+    return result
+
+
+def _save_connector(connector_type: str, data: dict):
+    """Save connector — Postgres primary, JSON file kept in sync."""
+    if _DB_ENABLED:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(asyncio.run, _db_repo.upsert_connector(connector_type, data)).result(timeout=5)
+            else:
+                loop.run_until_complete(_db_repo.upsert_connector(connector_type, data))
+        except Exception:
+            pass
+    # Keep JSON file in sync as backup
+    try:
+        existing = json.loads(_CONNECTORS_FILE.read_text())
+        connectors = {c['connector_type']: c for c in existing.get('connectors', [])}
+    except Exception:
+        connectors = {}
+    connectors[connector_type] = data
+    try:
+        _CONNECTORS_FILE.write_text(json.dumps({'connectors': list(connectors.values())}, indent=2))
+    except Exception:
+        pass
+
+
+@app.get('/api/super/connectors')
+async def list_connectors(_: dict = Depends(require_super_admin)):
+    """List all connector definitions with status (credentials redacted)."""
+    return {'connectors': _load_connectors()}
+
+
+@app.put('/api/super/connectors/{connector_type}')
+async def upsert_connector(connector_type: str, request: Request, _: dict = Depends(require_super_admin)):
+    """Create or update a connector's credentials and configuration."""
+    body = await request.json()
+    if connector_type not in [d['connector_type'] for d in _CONNECTOR_DEFAULTS]:
+        raise HTTPException(status_code=400, detail=f'Unknown connector type: {connector_type}')
+    try:
+        existing = json.loads(_CONNECTORS_FILE.read_text())
+        connectors = {c['connector_type']: c for c in existing.get('connectors', [])}
+    except Exception:
+        connectors = {}
+    prev = connectors.get(connector_type, {})
+    creds = {}
+    if connector_type == 'microsoft_azure':
+        if body.get('tenant_id'):  creds['tenant_id']     = body['tenant_id']
+        if body.get('client_id'):  creds['client_id']     = body['client_id']
+        if body.get('client_secret'): creds['client_secret'] = body['client_secret']
+    elif connector_type == 'atlassian':
+        if body.get('email'):          creds['email']           = body['email']
+        if body.get('api_token'):      creds['api_token']       = body['api_token']
+        if body.get('confluence_url'): creds['confluence_url']  = body['confluence_url']
+        if body.get('jira_url'):       creds['jira_url']        = body['jira_url']
+    # Merge: keep old creds if new ones not supplied
+    merged_creds = {**prev.get('credentials', {}), **creds}
+    record = {
+        'connector_type': connector_type,
+        'display_name': body.get('display_name', prev.get('display_name', connector_type)),
+        'status': 'disconnected' if merged_creds else 'not_configured',
+        'enabled': body.get('enabled', prev.get('enabled', False)),
+        'credentials': merged_creds,
+    }
+    _save_connector(connector_type, record)
+    safe = {k: v for k, v in record.items() if k != 'credentials'}
+    safe['has_credentials'] = bool(merged_creds)
+    return safe
+
+
+@app.post('/api/super/connectors/{connector_type}/test')
+async def test_connector(connector_type: str, _: dict = Depends(require_super_admin)):
+    """Test connector reachability. Returns {ok, message}."""
+    try:
+        data = json.loads(_CONNECTORS_FILE.read_text())
+        connectors = {c['connector_type']: c for c in data.get('connectors', [])}
+    except Exception:
+        connectors = {}
+    connector = connectors.get(connector_type)
+    if not connector or not connector.get('credentials'):
+        return {'ok': False, 'message': 'Connector not configured. Save credentials first.'}
+    creds = connector.get('credentials', {})
+    # Basic reachability test (no actual OAuth — just validate fields present)
+    if connector_type == 'microsoft_azure':
+        required = ['tenant_id', 'client_id', 'client_secret']
+        missing = [k for k in required if not creds.get(k)]
+        if missing:
+            return {'ok': False, 'message': f'Missing fields: {", ".join(missing)}'}
+        # Try a token endpoint ping
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                tenant = creds['tenant_id']
+                resp = await client.get(
+                    f'https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration'
+                )
+            if resp.status_code == 200:
+                return {'ok': True, 'message': 'Microsoft tenant endpoint reachable. Credentials format valid.'}
+            return {'ok': False, 'message': f'Microsoft endpoint returned HTTP {resp.status_code}'}
+        except Exception as e:
+            return {'ok': False, 'message': f'Network error: {str(e)[:120]}'}
+    elif connector_type == 'atlassian':
+        required = ['email', 'api_token']
+        missing = [k for k in required if not creds.get(k)]
+        if missing:
+            return {'ok': False, 'message': f'Missing fields: {", ".join(missing)}'}
+        try:
+            import base64 as _b64
+            token = _b64.b64encode(f"{creds['email']}:{creds['api_token']}".encode()).decode()
+            base_url = creds.get('confluence_url') or creds.get('jira_url', '')
+            if not base_url:
+                return {'ok': False, 'message': 'No Confluence or Jira URL provided.'}
+            base_url = base_url.rstrip('/')
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(
+                    f'{base_url}/rest/api/user/current',
+                    headers={'Authorization': f'Basic {token}', 'Accept': 'application/json'}
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                name = data.get('displayName') or data.get('name', 'unknown')
+                return {'ok': True, 'message': f'Authenticated as {name}'}
+            return {'ok': False, 'message': f'Atlassian returned HTTP {resp.status_code}'}
+        except Exception as e:
+            return {'ok': False, 'message': f'Network error: {str(e)[:120]}'}
+    return {'ok': False, 'message': 'Test not implemented for this connector type.'}
+
+
+@app.delete('/api/super/connectors/{connector_type}')
+async def delete_connector(connector_type: str, _: dict = Depends(require_super_admin)):
+    """Delete a connector configuration."""
+    try:
+        existing = json.loads(_CONNECTORS_FILE.read_text())
+        connectors = {c['connector_type']: c for c in existing.get('connectors', [])}
+    except Exception:
+        connectors = {}
+    if connector_type not in connectors:
+        raise HTTPException(status_code=404, detail='Connector not found')
+    del connectors[connector_type]
+    _CONNECTORS_FILE.write_text(json.dumps({'connectors': list(connectors.values())}, indent=2))
+    return {'ok': True, 'deleted': connector_type}
+
+
+@app.get('/api/super/workers/{worker_id}/connector-scope')
+async def get_worker_connector_scope(worker_id: str, _: dict = Depends(require_super_admin)):
+    """Return the connector_scope for a worker."""
+    worker = _find_worker(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    return {'worker_id': worker_id, 'connector_scope': worker.get('connector_scope', {})}
+
+
+@app.put('/api/super/workers/{worker_id}/connector-scope/{connector_type}')
+async def set_worker_connector_scope(
+    worker_id: str,
+    connector_type: str,
+    request: Request,
+    _: dict = Depends(require_super_admin),
+):
+    """Set the connector scope for a specific connector on a worker."""
+    body = await request.json()
+    workers = _load_workers()
+    target = None
+    for w in workers:
+        if w.get('worker_id') == worker_id:
+            target = w
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail='Worker not found')
+    if 'connector_scope' not in target:
+        target['connector_scope'] = {}
+    target['connector_scope'][connector_type] = body
+    _save_workers(workers)
+    return {'worker_id': worker_id, 'connector_type': connector_type, 'scope': body}
+
+
+@app.get('/api/admin/tools')
+async def list_tools_for_admin(user: dict = Depends(require_admin)):
+    """Return all tools from SAJHA with their config (for admin tool library view)."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+            from agent.tools import SAJHA_BASE, _service_headers
+            r = await client.get(SAJHA_BASE + '/api/tools/list', headers=_service_headers())
+        if r.status_code == 200:
+            return r.json()
+        return {'tools': [], 'error': f'SAJHA returned {r.status_code}'}
+    except Exception as e:
+        return {'tools': [], 'error': str(e)}
+
+
+# ── Documentation screenshot helper ────────────────────────────────────────────
+import base64 as _b64
+
+class _ScreenshotPayload(BaseModel):
+    name: str
+    data: str
+
+@app.post('/api/dev/screenshot')
+async def save_dev_screenshot(payload: _ScreenshotPayload):
+    """Accept a base64 screenshot from the browser and save it to Documentation/screenshots/."""
+    save_dir = pathlib.Path(__file__).parent / 'Documentation' / 'screenshots'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    img_data = payload.data
+    if ',' in img_data:
+        img_data = img_data.split(',', 1)[1]
+    filepath = save_dir / f"{payload.name}.png"
+    with open(str(filepath), 'wb') as f:
+        f.write(_b64.b64decode(img_data))
+    return {'saved': str(filepath)}
+
+
+# ── Static frontend (dev: one port; Docker: nginx serves this instead) ─────────
+_PUBLIC = pathlib.Path(__file__).parent / 'public'
+if _PUBLIC.is_dir():
+    app.mount('/', StaticFiles(directory=str(_PUBLIC), html=True), name='static')
