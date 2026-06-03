@@ -39,11 +39,7 @@ from agent.sub_agent_tool import set_stream_writer as _set_stream_writer
 
 _sys.path.insert(0, str(pathlib.Path(__file__).parent / 'sajhamcpserver'))
 from sajha.tools.impl.fs_index import build_index, get_index
-from agent.repository import (
-    WorkerRepository as _WorkerRepository,
-    PostgresWorkerRepository as _PGWorkerRepository,
-    UserRepository as _UserRepository,
-)
+from agent.repository import WorkerRepository as _WorkerRepository, PostgresWorkerRepository as _PGWorkerRepository
 from sajha.storage import storage as _storage
 _S3_MODE = os.getenv('STORAGE_BACKEND', 'local') == 's3'
 
@@ -55,13 +51,14 @@ if _DB_ENABLED:
 _JWT_SECRET = os.getenv('JWT_SECRET', 'sajha-dev-secret-change-in-prod')
 _SAJHA_USERS_FILE  = pathlib.Path('sajhamcpserver/config/users.json')
 _SAJHA_WORKERS_FILE = pathlib.Path('sajhamcpserver/config/workers.json')
-_SAJHA_APIKEYS_FILE = pathlib.Path('sajhamcpserver/config/apikeys.json')
 
 _STORAGE_BACKEND = _os.environ.get('STORAGE_BACKEND', 'local')
 
-# Repository singletons — Agent-scoped configuration management (all JSON-backed)
-_worker_repo = _WorkerRepository(config_path=str(_SAJHA_WORKERS_FILE))
-_user_repo = _UserRepository(config_path=str(_SAJHA_USERS_FILE))
+# WorkerRepository singleton — Postgres when DATABASE_URL set, JSON fallback (REQ-07 P1)
+if _DB_ENABLED:
+    _worker_repo = _PGWorkerRepository()
+else:
+    _worker_repo = _WorkerRepository(config_path=str(_SAJHA_WORKERS_FILE))
 
 
 def serve_file(path: str, media_type: str = None) -> Response:
