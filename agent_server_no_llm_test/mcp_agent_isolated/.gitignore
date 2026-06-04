@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Environment & secrets
+.env
+.secrets/
+*.env.local
+*.env.*.local
+connector_credentials.env
+api azure
+
+# DuckDB runtime artifacts
+*.db.wal
+
+# Large bank filing data (too large for git)
+bank_filings/
+regulatory_downloads/
+regulatory_md/
+
+# Test artifacts
+test_screenshots/
+.pytest_cache/
+*.log
+
+# SAJHA server internals
+sajhamcpserver/venv/
+sajhamcpserver/.venv/
+sajhamcpserver/logs/
+sajhamcpserver/__pycache__/
+sajhamcpserver/**/__pycache__/
+sajhamcpserver/*.log
+sajhamcpserver/.env
+
+# SQLite checkpoints
+*.db
+*.sqlite
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code internals
+.claude/worktrees/
+
+# Python sandbox venv (REQ-04a)
+sajhamcpserver/python_sandbox_venv/
+
+# SQLite agent checkpoints
+sajhamcpserver/data/checkpoints.db
+CREDENTIALS.md
+
+# Runtime data — worker files, uploads, audit logs, charts, indexes
+# These are generated at runtime and must NOT be committed
+sajhamcpserver/data/audit/
+sajhamcpserver/data/threads.jsonl
+sajhamcpserver/data/workers/*/domain_data/
+sajhamcpserver/data/workers/*/my_data/
+sajhamcpserver/data/workers/*/workflows/
+sajhamcpserver/data/common/
+sajhamcpserver/data/checkpoints.db-shm
+sajhamcpserver/data/checkpoints.db-wal
+sajhamcpserver/data/workers/*/domain_data/.index.json
+sajhamcpserver/data/workers/*/workflows/verified/.index.json
+
+# Playwright MCP
+.playwright-mcp/
+
+# Misc local artifacts
+market_risk_worker*.zip
+*.bak
+*.backup
+ziJp5YFV
+data/
+download_bmo_excel.py
+stats_calculator.py
+BMO_Q4_2025_Summary.xlsx
+.env.production

@@ -1,0 +1,28 @@
+{
+  "provider": "anthropic",
+  "anthropic": {
+    "api_key": "YOUR_ANTHROPIC_API_KEY_HERE",
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 8192
+  },
+  "xai": {
+    "api_key": "",
+    "model": "grok-3",
+    "max_tokens": 8192
+  },
+  "huggingface": {
+    "api_key": "YOUR_HUGGINGFACE_API_KEY_HERE",
+    "model": "meta-llama/Llama-3.3-70B-Instruct",
+    "max_tokens": 4096
+  },
+  "groq": {
+    "api_key": "YOUR_GROQ_API_KEY_HERE",
+    "model": "llama-3.3-70b-versatile",
+    "max_tokens": 8192
+  },
+  "bedrock": {
+    "model_id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "region": "us-east-1",
+    "max_tokens": 8192
+  }
+}

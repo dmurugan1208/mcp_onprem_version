@@ -1,0 +1,152 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.1, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\Durga Vishalini\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Durga Vishalini\mcp_onprem\mcp_agent
+plugins: anyio-4.13.0, langsmith-0.8.5, asyncio-1.3.0, cov-7.1.0, flask-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 14 items
+
+tests/test_api_comprehensive.py::test_001_health_endpoint FAILED         [  7%]
+tests/test_api_comprehensive.py::test_002_login_api FAILED               [ 14%]
+tests/test_api_comprehensive.py::test_003_invalid_login FAILED           [ 21%]
+tests/test_api_comprehensive.py::test_004_list_workers FAILED            [ 28%]
+tests/test_api_comprehensive.py::test_005_list_users FAILED              [ 35%]
+tests/test_api_comprehensive.py::test_006_create_worker FAILED           [ 42%]
+tests/test_api_comprehensive.py::test_007_create_user FAILED             [ 50%]
+tests/test_api_comprehensive.py::test_008_get_worker FAILED              [ 57%]
+tests/test_api_comprehensive.py::test_009_update_worker FAILED           [ 64%]
+tests/test_api_comprehensive.py::test_010_delete_worker FAILED           [ 71%]
+tests/test_api_comprehensive.py::test_011_update_user FAILED             [ 78%]
+tests/test_api_comprehensive.py::test_012_delete_user FAILED             [ 85%]
+tests/test_api_comprehensive.py::test_013_unauthorized_access FAILED     [ 92%]
+tests/test_api_comprehensive.py::test_014_missing_jwt FAILED             [100%]
+
+================================== FAILURES ===================================
+__________________________ test_001_health_endpoint ___________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+_____________________________ test_002_login_api ______________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+___________________________ test_003_invalid_login ____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+____________________________ test_004_list_workers ____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+_____________________________ test_005_list_users _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+___________________________ test_006_create_worker ____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+____________________________ test_007_create_user _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+_____________________________ test_008_get_worker _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+___________________________ test_009_update_worker ____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+___________________________ test_010_delete_worker ____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+____________________________ test_011_update_user _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+____________________________ test_012_delete_user _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+________________________ test_013_unauthorized_access _________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+____________________________ test_014_missing_jwt _____________________________
+async def functions are not natively supported.
+You need to install a suitable plugin for your async framework, for example:
+  - anyio
+  - pytest-asyncio
+  - pytest-tornasync
+  - pytest-trio
+  - pytest-twisted
+=========================== short test summary info ===========================
+FAILED tests/test_api_comprehensive.py::test_001_health_endpoint - Failed: as...
+FAILED tests/test_api_comprehensive.py::test_002_login_api - Failed: async de...
+FAILED tests/test_api_comprehensive.py::test_003_invalid_login - Failed: asyn...
+FAILED tests/test_api_comprehensive.py::test_004_list_workers - Failed: async...
+FAILED tests/test_api_comprehensive.py::test_005_list_users - Failed: async d...
+FAILED tests/test_api_comprehensive.py::test_006_create_worker - Failed: asyn...
+FAILED tests/test_api_comprehensive.py::test_007_create_user - Failed: async ...
+FAILED tests/test_api_comprehensive.py::test_008_get_worker - Failed: async d...
+FAILED tests/test_api_comprehensive.py::test_009_update_worker - Failed: asyn...
+FAILED tests/test_api_comprehensive.py::test_010_delete_worker - Failed: asyn...
+FAILED tests/test_api_comprehensive.py::test_011_update_user - Failed: async ...
+FAILED tests/test_api_comprehensive.py::test_012_delete_user - Failed: async ...
+FAILED tests/test_api_comprehensive.py::test_013_unauthorized_access - Failed...
+FAILED tests/test_api_comprehensive.py::test_014_missing_jwt - Failed: async ...
+============================= 14 failed in 0.30s ==============================

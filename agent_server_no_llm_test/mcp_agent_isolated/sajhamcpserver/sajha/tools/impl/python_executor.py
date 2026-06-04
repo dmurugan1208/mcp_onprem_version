@@ -1,0 +1,707 @@
+"""
+Python Execution Tools — REQ-04a
+Sandboxed Python execution with figure capture for matplotlib and Plotly.
+"""
+
+import ast
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Any, Dict, List, Optional
+
+from sajha.tools.base_mcp_tool import BaseMCPTool
+from sajha.path_resolver import resolve as path_resolve
+from sajha.storage import storage
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Absolute path to the sandbox venv Python interpreter.
+# Resolved relative to *this* file so it works regardless of CWD.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# sajhamcpserver/sajha/tools/impl -> up 3 levels -> sajhamcpserver/
+_SAJHA_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..', '..'))
+SANDBOX_VENV_PYTHON = os.path.join(_SAJHA_ROOT, 'python_sandbox_venv', 'bin', 'python')
+
+# ---------------------------------------------------------------------------
+# Blocked imports — AST-based security scanner
+# ---------------------------------------------------------------------------
+
+BLOCKED_IMPORTS = {
+    'os', 'sys', 'subprocess', 'socket', 'requests', 'urllib',
+    'http', 'ftplib', 'smtplib', 'imaplib', 'poplib',
+    'multiprocessing', 'threading', 'ctypes', 'cffi',
+    'importlib', '__builtins__', 'builtins',
+}
+
+
+def scan_code(code: str) -> List[str]:
+    """Return list of blocked import names found in code (via AST, not regex)."""
+    violations: List[str] = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise ValueError(f"Syntax error: {exc}")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split('.')[0]
+                if root in BLOCKED_IMPORTS:
+                    violations.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                root = node.module.split('.')[0]
+                if root in BLOCKED_IMPORTS:
+                    violations.append(node.module)
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Sandbox preamble — injected before every user script
+# ---------------------------------------------------------------------------
+
+SANDBOX_PREAMBLE = r"""
+import os as _os, sys as _sys, json as _json, atexit as _atexit
+
+# Memory limit (1.5 GB) — only available on Linux; silently skip on macOS/Windows
+# Plotly template initialisation requires ~800MB+ address space; 512MB caused MemoryError.
+try:
+    import resource as _resource
+    _MEM = 1536 * 1024 * 1024
+    _resource.setrlimit(_resource.RLIMIT_AS, (_MEM, _MEM))
+except (ImportError, ValueError, _resource.error):
+    pass
+
+# Figure tracking
+_FIGURES = []
+_SANDBOX_DIR = _os.environ.get('SANDBOX_DIR', '/tmp/sandbox')
+
+# DATA_DIR — absolute path to the worker's domain_data directory.
+# Use this to read files directly: pd.read_csv(f"{DATA_DIR}/iris/iris_combined.csv")
+# os module is blocked in user code; use this variable instead.
+DATA_DIR = _os.environ.get('DATA_DIR', '')
+
+# Matplotlib intercept
+try:
+    import matplotlib as _mpl
+    _mpl.use('Agg')
+    import matplotlib.pyplot as _plt
+    def _patched_show(*args, **kwargs):
+        fname = _os.path.join(_SANDBOX_DIR, f'fig_{len(_FIGURES)}.png')
+        _plt.savefig(fname, dpi=150, bbox_inches='tight')
+        _FIGURES.append({'type': 'png', 'path': fname})
+    _plt.show = _patched_show
+except ImportError:
+    pass
+
+# Plotly intercept
+try:
+    import plotly.io as _pio
+    def _patched_plotly_show(fig, *args, **kwargs):
+        fname = _os.path.join(_SANDBOX_DIR, f'fig_{len(_FIGURES)}.html')
+        fig.write_html(fname)
+        _FIGURES.append({'type': 'html', 'path': fname})
+    _pio.show = _patched_plotly_show
+except ImportError:
+    pass
+
+# Write figure manifest on exit
+def _write_manifest():
+    manifest_path = _os.path.join(_SANDBOX_DIR, 'figures.json')
+    with open(manifest_path, 'w') as _f:
+        _json.dump(_FIGURES, _f)
+_atexit.register(_write_manifest)
+# Note: do NOT delete _os/_json here — the atexit callback still references them
+"""
+
+
+# ---------------------------------------------------------------------------
+# Worker context helper
+# ---------------------------------------------------------------------------
+
+def _get_worker_ctx() -> dict:
+    try:
+        from flask import g as _g
+        return getattr(_g, 'worker_ctx', {}) or {}
+    except RuntimeError:
+        return {}
+
+
+def _get_user_id() -> Optional[str]:
+    try:
+        from flask import g as _g
+        return getattr(_g, 'user_id', None)
+    except RuntimeError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Core sandbox runner
+# ---------------------------------------------------------------------------
+
+def _run_sandboxed(
+    code: str,
+    tmpdir: str,
+    timeout: int = 60,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> dict:
+    """Write code to tmpdir, execute in sandbox venv, return raw result dict."""
+    script_path = os.path.join(tmpdir, 'user_script.py')
+    with open(script_path, 'w', encoding='utf-8') as fh:
+        fh.write(SANDBOX_PREAMBLE + '\n')
+        fh.write(code)
+
+    env: Dict[str, str] = {
+        'PATH': os.path.join(os.path.dirname(SANDBOX_VENV_PYTHON)),
+        'HOME': tmpdir,
+        'PYTHONPATH': '',
+        'SANDBOX_DIR': tmpdir,
+        # Block network proxies
+        'NO_PROXY': '*',
+        'no_proxy': '*',
+        'http_proxy': '',
+        'https_proxy': '',
+        'HTTP_PROXY': '',
+        'HTTPS_PROXY': '',
+    }
+    if extra_env:
+        env.update(extra_env)
+
+    if not os.path.isfile(SANDBOX_VENV_PYTHON):
+        return {
+            'stdout': '',
+            'stderr': (
+                f'Sandbox Python interpreter not found: {SANDBOX_VENV_PYTHON}. '
+                'Run: python -m venv sajhamcpserver/python_sandbox_venv && '
+                'sajhamcpserver/python_sandbox_venv/bin/pip install pandas numpy scipy '
+                'matplotlib plotly openpyxl pyarrow statsmodels'
+            ),
+            'exit_code': -1,
+            'elapsed_seconds': 0.0,
+            'timed_out': False,
+        }
+
+    start = time.monotonic()
+    try:
+        result = subprocess.run(
+            [SANDBOX_VENV_PYTHON, script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=tmpdir,
+            env=env,
+        )
+        elapsed = time.monotonic() - start
+        return {
+            'stdout': result.stdout[:20_000],
+            'stderr': result.stderr[:5_000],
+            'exit_code': result.returncode,
+            'elapsed_seconds': round(elapsed, 3),
+            'timed_out': False,
+        }
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        return {
+            'stdout': '',
+            'stderr': f'Execution timed out after {timeout} seconds.',
+            'exit_code': -1,
+            'elapsed_seconds': round(elapsed, 3),
+            'timed_out': True,
+        }
+
+
+def _collect_figures(tmpdir: str, charts_dir: str) -> List[Dict[str, str]]:
+    """
+    Read figures.json from the sandbox temp dir, copy each figure to charts_dir,
+    and return a list of figure dicts with 'type', 'filename', and 'url' fields.
+    """
+    manifest_path = os.path.join(tmpdir, 'figures.json')
+    if not os.path.exists(manifest_path):
+        return []
+    try:
+        with open(manifest_path, encoding='utf-8') as fh:
+            raw_figures: List[Dict] = json.load(fh)
+    except Exception:
+        return []
+
+    # mkdir only for local paths; S3 storage creates "directories" on write
+    if not str(charts_dir).startswith('s3://'):
+        os.makedirs(charts_dir, exist_ok=True)
+    figures: List[Dict[str, str]] = []
+    for entry in raw_figures:
+        src_path = entry.get('path', '')
+        fig_type = entry.get('type', 'png')
+        if not src_path or not os.path.exists(src_path):
+            continue
+        filename = os.path.basename(src_path)
+        dest = os.path.join(charts_dir, filename)
+        try:
+            import pathlib as _pl
+            storage.write_bytes(dest, _pl.Path(src_path).read_bytes())
+            figures.append({
+                'type': fig_type,
+                'filename': filename,
+                'url': f'/api/fs/charts/{filename}',
+            })
+        except Exception:
+            pass
+    return figures
+
+
+def _copy_context_files(context_files: List[str], tmpdir: str, worker_ctx: dict, user_id: Optional[str]):
+    """
+    Copy requested context files from domain_data or my_data into tmpdir
+    so user code can read them as local files.
+    """
+    for rel_path in context_files:
+        rel_path = rel_path.strip().lstrip('/')
+        resolved = None
+
+        # Try my_data first (prefix 'my_data/')
+        if rel_path.startswith('my_data/'):
+            inner = rel_path[len('my_data/'):]
+            if worker_ctx and user_id:
+                try:
+                    base = path_resolve('my_data', worker_ctx, user_id=user_id)
+                    candidate = os.path.join(base, inner)
+                    if storage.exists(candidate):
+                        resolved = candidate
+                except Exception:
+                    pass
+        elif rel_path.startswith('domain_data/'):
+            inner = rel_path[len('domain_data/'):]
+            if worker_ctx:
+                try:
+                    base = path_resolve('domain_data', worker_ctx)
+                    candidate = os.path.join(base, inner)
+                    if storage.exists(candidate):
+                        resolved = candidate
+                except Exception:
+                    pass
+
+        # Also handle common/ prefix
+        if resolved is None and rel_path.startswith('common/'):
+            inner = rel_path[len('common/'):]
+            if worker_ctx:
+                try:
+                    base = path_resolve('common_data', worker_ctx)
+                    candidate = os.path.join(base, inner)
+                    if storage.exists(candidate):
+                        resolved = candidate
+                except Exception:
+                    pass
+
+        # Fallback: treat as bare/relative filename and search all three sections.
+        # Handles both "iris_combined.csv" (bare) and "iris/iris_combined.csv" (subfolder).
+        if resolved is None and worker_ctx:
+            for section in ('my_data', 'domain_data', 'common_data'):
+                try:
+                    kw = {'user_id': user_id} if section == 'my_data' and user_id else {}
+                    base = path_resolve(section, worker_ctx, **kw)
+                    candidate = os.path.join(base, rel_path)
+                    if storage.exists(candidate):
+                        resolved = candidate
+                        break
+                except Exception:
+                    pass
+
+        # Last resort: recursive walk — finds "iris_combined.csv" even inside subfolders
+        if resolved is None and worker_ctx:
+            bare = os.path.basename(rel_path)
+            for section in ('my_data', 'domain_data', 'common_data'):
+                try:
+                    kw = {'user_id': user_id} if section == 'my_data' and user_id else {}
+                    base = path_resolve(section, worker_ctx, **kw)
+                    for rel_key in storage.list_prefix(base):
+                        if os.path.basename(rel_key) == bare:
+                            resolved = os.path.join(base, rel_key)
+                            break
+                    if resolved:
+                        break
+                except Exception:
+                    pass
+
+        if resolved:
+            dest = os.path.join(tmpdir, os.path.basename(resolved))
+            try:
+                with open(dest, 'wb') as _f:
+                    _f.write(storage.read_bytes(resolved))
+            except Exception:
+                pass
+
+
+def _charts_dir(worker_ctx: dict, user_id: Optional[str]) -> str:
+    """Return the charts directory path for the current user."""
+    if worker_ctx and user_id:
+        try:
+            my_data_base = path_resolve('my_data', worker_ctx, user_id=user_id)
+            return os.path.join(my_data_base, 'charts')
+        except Exception:
+            pass
+    # Fallback: use X-Worker-My-Data-Root header injected by the agent server (G-04).
+    # g.worker_ctx is not reconstructed from headers, but g.worker_my_data_root is.
+    try:
+        from flask import g as _g
+        my_data_root = getattr(_g, 'worker_my_data_root', '') or ''
+        if my_data_root:
+            return os.path.join(my_data_root.strip(), 'charts')
+    except RuntimeError:
+        pass
+    return os.path.join(tempfile.gettempdir(), 'sajha_charts')
+
+
+# ---------------------------------------------------------------------------
+# PythonExecuteTool
+# ---------------------------------------------------------------------------
+
+class PythonExecuteTool(BaseMCPTool):
+    """Execute ad-hoc Python code in a sandboxed subprocess environment."""
+
+    def get_input_schema(self) -> Dict:
+        return self.config.get('inputSchema', {
+            'type': 'object',
+            'properties': {
+                'code': {
+                    'type': 'string',
+                    'description': (
+                        'Python code to execute. Available libraries: '
+                        'pandas, numpy, scipy, matplotlib, plotly, openpyxl, '
+                        'pyarrow, statsmodels, arch, riskfolio, sklearn, networkx, xarray. '
+                        'The variable DATA_DIR is pre-set to the worker domain_data path — '
+                        'use it to read files directly: pd.read_csv(f"{DATA_DIR}/iris/iris_combined.csv"). '
+                        'The os module is blocked; use DATA_DIR instead of os.path.'
+                    ),
+                },
+                'context_files': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': (
+                        'Optional: copy specific files into the sandbox working directory. '
+                        'Accepts relative paths from domain_data (e.g. "iris/iris_combined.csv") '
+                        'or prefixed paths ("my_data/report.csv", "domain_data/iris/data.csv"). '
+                        'Files are then accessible by basename only: pd.read_csv("iris_combined.csv"). '
+                        'Prefer DATA_DIR for direct access without copying.'
+                    ),
+                },
+                'timeout_seconds': {
+                    'type': 'integer',
+                    'default': 60,
+                    'maximum': 90,
+                    'description': 'Execution timeout in seconds (max 90).',
+                },
+            },
+            'required': ['code'],
+        })
+
+    def get_output_schema(self) -> Dict:
+        return {
+            'type': 'object',
+            'properties': {
+                'stdout': {'type': 'string'},
+                'stderr': {'type': 'string'},
+                'exit_code': {'type': 'integer'},
+                'elapsed_seconds': {'type': 'number'},
+                'figures': {'type': 'array'},
+                'error': {'type': ['string', 'null']},
+                '_python_ready': {'type': 'boolean'},
+            },
+        }
+
+    def execute(self, arguments: Dict[str, Any]) -> Any:
+        code: str = arguments.get('code', '').strip()
+        context_files: List[str] = arguments.get('context_files') or []
+        timeout: int = min(int(arguments.get('timeout_seconds', 60)), 90)
+
+        if not code:
+            return {
+                'stdout': '', 'stderr': '', 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': 'No code provided.', '_python_ready': False,
+            }
+
+        # --- Security scan ---
+        try:
+            violations = scan_code(code)
+        except ValueError as exc:
+            return {
+                'stdout': '', 'stderr': str(exc), 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': str(exc), '_python_ready': False,
+            }
+
+        if violations:
+            msg = (
+                f"Blocked import(s) detected: {', '.join(violations)}. "
+                "Network access and system-level modules are not permitted in the sandbox."
+            )
+            return {
+                'stdout': '', 'stderr': msg, 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': msg, '_python_ready': False,
+            }
+
+        worker_ctx = _get_worker_ctx()
+        user_id = _get_user_id()
+
+        # Resolve domain_data path to inject into sandbox as DATA_DIR env var.
+        # This lets agent code do: pd.read_csv(f"{os.environ['DATA_DIR']}/iris/iris_combined.csv")
+        # without needing context_files and without os module access to the host filesystem.
+        extra_env: dict = {}
+        if worker_ctx:
+            try:
+                dd = path_resolve('domain_data', worker_ctx)
+                if dd:
+                    extra_env['DATA_DIR'] = dd
+            except Exception:
+                pass
+
+        # Fallback: g.worker_ctx is not reconstructed from headers, but g.worker_data_root is.
+        # (Same pattern as _charts_dir fallback above.)
+        if not extra_env.get('DATA_DIR'):
+            try:
+                from flask import g as _g
+                wr = getattr(_g, 'worker_data_root', '') or ''
+                if wr:
+                    extra_env['DATA_DIR'] = wr.strip()
+            except RuntimeError:
+                pass
+
+        with tempfile.TemporaryDirectory(prefix='sajha_sandbox_') as tmpdir:
+            # Copy requested context files into the sandbox working dir
+            if context_files:
+                _copy_context_files(context_files, tmpdir, worker_ctx, user_id)
+
+            # Execute
+            run_result = _run_sandboxed(code, tmpdir, timeout=timeout, extra_env=extra_env or None)
+
+            # Collect figures
+            c_dir = _charts_dir(worker_ctx, user_id)
+            figures = _collect_figures(tmpdir, c_dir)
+
+        error: Optional[str] = None
+        if run_result['timed_out']:
+            error = f"Execution timed out after {timeout} seconds."
+        elif run_result['exit_code'] != 0 and run_result['stderr']:
+            error = run_result['stderr'][:500]
+
+        return {
+            'stdout': run_result['stdout'],
+            'stderr': run_result['stderr'],
+            'exit_code': run_result['exit_code'],
+            'elapsed_seconds': run_result['elapsed_seconds'],
+            'figures': figures,
+            'error': error,
+            '_python_ready': True,
+        }
+
+
+# ---------------------------------------------------------------------------
+# PythonRunScriptTool
+# ---------------------------------------------------------------------------
+
+class PythonRunScriptTool(BaseMCPTool):
+    """Run a .py script from domain_data or my_data in the sandboxed environment."""
+
+    def get_input_schema(self) -> Dict:
+        return self.config.get('inputSchema', {
+            'type': 'object',
+            'properties': {
+                'script_path': {
+                    'type': 'string',
+                    'description': (
+                        "Path to a .py script relative to the section root "
+                        "(e.g. 'scripts/analyse.py')."
+                    ),
+                },
+                'section': {
+                    'type': 'string',
+                    'enum': ['domain_data', 'my_data', 'common'],
+                    'description': 'Data layer containing the script. Default: domain_data. Tool auto-searches all layers if not found in the specified one.',
+                },
+                'args': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Command-line arguments passed to the script via sys.argv.',
+                },
+                'timeout_seconds': {
+                    'type': 'integer',
+                    'default': 60,
+                    'maximum': 90,
+                    'description': 'Execution timeout in seconds (max 90).',
+                },
+            },
+            'required': ['script_path', 'section'],
+        })
+
+    def get_output_schema(self) -> Dict:
+        return {
+            'type': 'object',
+            'properties': {
+                'stdout': {'type': 'string'},
+                'stderr': {'type': 'string'},
+                'exit_code': {'type': 'integer'},
+                'elapsed_seconds': {'type': 'number'},
+                'figures': {'type': 'array'},
+                'error': {'type': ['string', 'null']},
+                '_python_ready': {'type': 'boolean'},
+            },
+        }
+
+    def execute(self, arguments: Dict[str, Any]) -> Any:
+        script_path: str = arguments.get('script_path', '').strip().lstrip('/')
+        section: str = arguments.get('section', 'domain_data')
+        args: List[str] = arguments.get('args') or []
+        timeout: int = min(int(arguments.get('timeout_seconds', 60)), 90)
+
+        if not script_path:
+            return {
+                'stdout': '', 'stderr': '', 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': 'No script_path provided.', '_python_ready': False,
+            }
+
+        if not script_path.endswith('.py'):
+            return {
+                'stdout': '', 'stderr': '', 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': 'Only .py scripts are supported.', '_python_ready': False,
+            }
+
+        worker_ctx = _get_worker_ctx()
+        user_id = _get_user_id()
+
+        # Resolve script location — try requested section first, then fallback all layers
+        all_sections = ['domain_data', 'my_data', 'common']
+        sections_to_try = [section]
+        for s in all_sections:
+            if s not in sections_to_try:
+                sections_to_try.append(s)
+
+        abs_script: Optional[str] = None
+        section_root: Optional[str] = None
+        resolve_errors: List[str] = []
+
+        for try_section in sections_to_try:
+            try:
+                if try_section == 'my_data':
+                    if user_id:
+                        candidate_root = path_resolve('my_data', worker_ctx, user_id=user_id)
+                    else:
+                        # Fallback: agent server injects the pre-scoped my_data path as a header
+                        try:
+                            from flask import g as _g
+                            mdr = getattr(_g, 'worker_my_data_root', '') or ''
+                            if mdr:
+                                candidate_root = mdr.strip()
+                            else:
+                                resolve_errors.append('my_data: user context not available')
+                                continue
+                        except RuntimeError:
+                            resolve_errors.append('my_data: user context not available')
+                            continue
+                elif try_section == 'common':
+                    candidate_root = path_resolve('common_data', worker_ctx)
+                else:
+                    candidate_root = path_resolve('domain_data', worker_ctx)
+                    # Fallback: use g.worker_data_root when worker_ctx is empty
+                    if not worker_ctx:
+                        try:
+                            from flask import g as _g
+                            wr = getattr(_g, 'worker_data_root', '') or ''
+                            if wr:
+                                candidate_root = wr.strip()
+                        except RuntimeError:
+                            pass
+            except Exception as exc:
+                resolve_errors.append(f'{try_section}: {exc}')
+                continue
+
+            # S3-safe path join and traversal guard (avoid os.path.normpath which corrupts s3://)
+            if candidate_root.startswith('s3://'):
+                candidate = candidate_root.rstrip('/') + '/' + script_path.lstrip('/')
+                if not candidate.startswith(candidate_root.rstrip('/')):
+                    resolve_errors.append(f'{try_section}: path traversal blocked')
+                    continue
+            else:
+                candidate = os.path.normpath(os.path.join(candidate_root, script_path))
+                if not candidate.startswith(os.path.normpath(candidate_root)):
+                    resolve_errors.append(f'{try_section}: path traversal blocked')
+                    continue
+
+            if storage.exists(candidate):
+                abs_script = candidate
+                section_root = candidate_root
+                break
+            else:
+                resolve_errors.append(f'{try_section}: not found')
+
+        if abs_script is None or section_root is None:
+            return {
+                'stdout': '', 'stderr': '', 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': f'Script not found: {script_path} (searched: {", ".join(resolve_errors)})',
+                '_python_ready': False,
+            }
+
+        # Read script source (storage.read_text works for both local and S3 paths)
+        try:
+            code = storage.read_text(abs_script, encoding='utf-8')
+        except Exception as exc:
+            return {
+                'stdout': '', 'stderr': str(exc), 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': f'Failed to read script: {exc}', '_python_ready': False,
+            }
+
+        # Security scan
+        try:
+            violations = scan_code(code)
+        except ValueError as exc:
+            return {
+                'stdout': '', 'stderr': str(exc), 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': str(exc), '_python_ready': False,
+            }
+
+        if violations:
+            msg = (
+                f"Blocked import(s) detected in script: {', '.join(violations)}. "
+                "Network access and system-level modules are not permitted in the sandbox."
+            )
+            return {
+                'stdout': '', 'stderr': msg, 'exit_code': 1,
+                'elapsed_seconds': 0.0, 'figures': [],
+                'error': msg, '_python_ready': False,
+            }
+
+        # Inject sys.argv if args provided
+        if args:
+            argv_repr = json.dumps([os.path.basename(abs_script)] + args)
+            argv_injection = f"import sys as _sys_argv; _sys_argv.argv = {argv_repr}\n"
+            code = argv_injection + code
+
+        with tempfile.TemporaryDirectory(prefix='sajha_sandbox_') as tmpdir:
+            run_result = _run_sandboxed(code, tmpdir, timeout=timeout)
+
+            c_dir = _charts_dir(worker_ctx, user_id)
+            figures = _collect_figures(tmpdir, c_dir)
+
+        error: Optional[str] = None
+        if run_result['timed_out']:
+            error = f"Execution timed out after {timeout} seconds."
+        elif run_result['exit_code'] != 0 and run_result['stderr']:
+            error = run_result['stderr'][:500]
+
+        return {
+            'stdout': run_result['stdout'],
+            'stderr': run_result['stderr'],
+            'exit_code': run_result['exit_code'],
+            'elapsed_seconds': run_result['elapsed_seconds'],
+            'figures': figures,
+            'error': error,
+            '_python_ready': True,
+        }
